@@ -26,6 +26,7 @@ from pathlib import Path
 
 from kiro_crew import __version__, beacon, platform_compat
 from kiro_crew.agent import reset_agent_model
+from kiro_crew.apps.backend import stop_recorded_app_backend
 from kiro_crew.apps.bridges import (
     deregister_app,
     deregister_app_crons_from_service,
@@ -738,6 +739,19 @@ def _handle_app(args: argparse.Namespace) -> None:
                 f"the name, so removing the app while it stands would let any "
                 f"future app installed under this name run code without asking. "
                 f"Nothing has been changed — clear the cause and retry.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Second precondition, same reason: the deregistration below is
+        # irreversible, so a backend that cannot be confirmed stopped has to
+        # abort while the app is still whole - not after its crons, agents,
+        # skills and MCP servers are already gone (uninstall_app re-checks,
+        # but by then this cleanup would have run).
+        if not stop_recorded_app_backend(args.name):
+            print(
+                f"[X] not uninstalling {args.name!r}: its backend is still "
+                f"running and could not be confirmed stopped. Nothing has "
+                f"been changed - stop it and retry.",
                 file=sys.stderr,
             )
             sys.exit(1)
