@@ -16,6 +16,7 @@ from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProvider
 from kiro_crew.monitoring.gitlab_merge_request import GitLabMergeRequestProvider
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_PROVIDER_CONCURRENCY,
+    MonitorCreationSurface,
     MonitorDecision,
     MonitorDispatchResult,
     MonitorState,
@@ -25,12 +26,18 @@ from kiro_crew.monitoring.pull_request import PullRequestProbeResult, provider_e
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 MONITOR_WAKE_MAX_CHARS = 4096
+# GitHub and GitLab monitors intentionally retain their existing ambient CLI
+# identity outside an explicitly authenticated dashboard creation. Every other
+# provider fails closed on channel or legacy-unknown provenance unless it is
+# explicitly added here with matching security docs.
+_CHANNEL_OWNER_CREDENTIAL_KINDS = frozenset({"github_pull_request", "gitlab_merge_request"})
 
 logger = logging.getLogger(__name__)
 
 
 class _Loop(Protocol):
     id: str
+    slot_key: str
     monitor: MonitorState | None
 
 
@@ -96,6 +103,7 @@ class _Provider(Protocol):
         raw_target: str,
         *,
         previous_observation: Mapping[str, object] | None = None,
+        use_owner_credentials: bool = True,
     ) -> PullRequestProbeResult: ...
 
 
@@ -181,6 +189,10 @@ class MonitorController:
                     provider.probe,
                     target,
                     previous_observation=previous_observation,
+                    use_owner_credentials=(
+                        state.creation_surface is MonitorCreationSurface.DASHBOARD
+                        or state.kind in _CHANNEL_OWNER_CREDENTIAL_KINDS
+                    ),
                 )
         except Exception:
             logger.exception("structured monitor provider raised unexpectedly")

@@ -2100,6 +2100,12 @@ restart. An accepted in-flight wake persists its finite completion-evidence
 deadline and resumes that deadline after restart; an older claim with no deadline
 is retained, inactive, and blocked. A persisted `BUSY` claim intentionally has no
 completion deadline and resumes its existing `next_due_ts` retry after restart.
+The record also persists the authenticated creation surface independently of its
+slot binding. Dashboard and native-channel consumers stamp it at the directive
+boundary; Slack-linked dashboard turns carry the channel stamp through queue and
+recovery paths. A missing stamp on a legacy record is `unknown` and denies ambient
+owner credentials for every provider outside the explicit GitHub/GitLab channel
+allowlist.
 Before a spent BUSY claim becomes terminal, its settlement path also clears any
 late transport-acceptance marker, so an inactive budget record cannot retain an
 accepted turn that no completion timer owns.
@@ -2139,7 +2145,11 @@ provider probe runs off the event loop behind one shared four-probe concurrency
 gate. Missing, unsupported, or untrusted provider CLI resolution is SEL-audited
 as denied before its setup error propagates; a resolved CLI must record its
 critical invocation event before spawn. Provider CLI resource limits are
-installed by the synchronous spawn shim after exec. Revoked GitLab hosts and
+installed by the synchronous spawn shim after exec. Because a structured monitor
+probe can expose an ambient provider login or invocation-scoped token, its
+`glab`/`az` executable and every parent must satisfy the protected system-owned,
+canonical trust policy even when interactive provider features use the relaxed
+same-user policy. Revoked GitLab hosts and
 incomplete Bitbucket credentials emit a credential-free `denied` audit before
 returning their terminal authorization or authentication failure, without provider
 I/O. Failure to write a denial audit never permits the rejected probe.
@@ -2494,6 +2504,10 @@ are refused while a wake is in flight. A second `monitor_watch` is likewise
 refused with 409 while the existing monitor has a wake in flight, preserving the
 old monitor ID until its correlated completion has been accounted. Cadence,
 positive budgets, and wake-instruction edits preserve the baseline and generation.
+When a channel-origin directive changes a monitor target, the persisted creation
+surface ratchets to `channel` in the same atomic update. A channel can therefore
+retarget a dashboard-created monitor without retaining dashboard-only owner
+credentials for the newly selected subject.
 Budget updates remain sparse through REST/directive authorization and merge with
 the current budget record only while holding the service lock, so independent
 concurrent edits cannot replace one another with values from stale snapshots.

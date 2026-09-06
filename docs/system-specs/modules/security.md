@@ -1362,7 +1362,11 @@ each probe; self-managed calls carry an explicit empty `GITLAB_TOKEN` scrub
 sentinel through environment construction so the shared minimal-environment
 builder cannot reintroduce the ambient token. GitLab
 and Azure execute only validated absolute `glab`/`az` binaries with minimal
-provider-scoped environments. The shared CLI transport strips ambient SSH and
+provider-scoped environments. Structured monitor probes require the canonical
+binary and its complete parent chain to be system-owned and non-writable by the
+gateway user, independent of the relaxed policy used by interactive provider
+surfaces, because the child can receive an ambient provider login or an
+invocation-scoped token. The shared CLI transport strips ambient SSH and
 language-runtime injection variables (including Python, virtualenv, Conda, and
 Node search paths), replaces inherited `PATH` with the platform's trusted system
 path when one exists, and routes the validated argv through
@@ -1389,6 +1393,20 @@ credential file and is denied to agent subprocesses. Bitbucket accepts only
 HTTPS Authorization header and are never placed in argv, monitor state, logs, or
 browser payloads. Azure DevOps Server and Bitbucket Data Center URLs fail before
 credentials or network access.
+
+The controller passes credential authority through the provider protocol on every
+probe. Each monitor persists the authenticated creation surface (`dashboard`,
+`channel`, or fail-closed `unknown`) separately from its storage binding. This is
+load-bearing for a channel message routed through a linked dashboard thread: the
+monitor keeps channel authority even though its durable slot key is a bare dashboard
+chat key. Dashboard-created monitors receive owner credentials. Channel-created and
+legacy monitors without provenance do not, except that GitHub and GitLab explicitly
+retain the established authenticated `gh` and host-authorized `glab` behavior. That
+exception is an allowlist, so an added provider gets no channel access to
+gateway-owner credentials by default. Channel-bound Azure probes record a
+credential-free `denied` SEL event and return authorization failure before reading
+the credential store or Azure CLI state. Channel-bound Bitbucket probes never read
+the credential store and use anonymous HTTPS, which limits them to public targets.
 
 Pod environments scrub the loader's complete credential roster, including the
 Azure DevOps and Bitbucket source-provider credentials, before an isolated gateway

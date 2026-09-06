@@ -32,6 +32,7 @@ import pytest
 import kiro_crew.autonudge_authz as autonudge_authz
 from kiro_crew.autonudge import NudgeAdmissionRefused, binding_key_for
 from kiro_crew.autonudge_authz import authorize_and_add_nudge
+from kiro_crew.monitoring.models import MonitorCreationSurface
 from kiro_crew.workflows.service import WorkflowService
 
 pytestmark = pytest.mark.asyncio
@@ -310,10 +311,11 @@ class FakeNudgeSvc:
         banner="",
         admission_check=None,
         gate=True,
+        creation_surface=MonitorCreationSurface.DASHBOARD,
     ):
         if admission_check is not None and not admission_check():
             raise NudgeAdmissionRefused("session changed before nudge arm committed")
-        self.added.append((slot_key, message, idle_secs, max_cycles))
+        self.added.append((slot_key, message, idle_secs, max_cycles, creation_surface))
         self.banners: list[str] = getattr(self, "banners", [])
         self.banners.append(banner)
         return SimpleNamespace(id="loop1", slot_key=slot_key, idle_secs=idle_secs, max_cycles=max_cycles)

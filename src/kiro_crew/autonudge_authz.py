@@ -34,7 +34,11 @@ from kiro_crew.autonudge import (
 )
 from kiro_crew.autonudge_selfarm import forget_self_arm, record_self_arm
 from kiro_crew.config.loader import workspace_dir_for
-from kiro_crew.monitoring.models import MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS, MonitorState
+from kiro_crew.monitoring.models import (
+    MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
+    MonitorCreationSurface,
+    MonitorState,
+)
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -524,6 +528,7 @@ async def authorize_and_add_nudge(
     # when the caller has no such provenance (REST, workflow ctx.nudge, apps).
     # Decides the crew/member self-arm exception -- see ``is_self_arm``.
     initiator_slot_key: str = "",
+    creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
 ) -> tuple[Any | None, str | None, int]:
     """Validate + authorize + arm a nudge loop; return ``(loop, error, status)``.
 
@@ -756,7 +761,7 @@ async def authorize_and_add_nudge(
             return (
                 current is authorized_slot
                 and mode_ok
-                and not bool(getattr(authorized_slot, "_closing", False))
+                and not bool(getattr(authorized_slot, "is_closing", False))
                 and str(getattr(current, "memory_mode", "persistent")) == "persistent"
             )
 
@@ -908,6 +913,7 @@ async def authorize_and_add_nudge(
                 "banner": banner,
                 "admission_check": admission_check,
                 "gate": gate,
+                "creation_surface": creation_surface,
             }
             if not replace_existing:
                 add_kwargs["replace_existing"] = False
@@ -931,6 +937,7 @@ async def authorize_and_add_nudge(
                 "budgets": monitor.budgets,
                 "wake_instructions": monitor_wake_instructions,
                 "admission_check": admission_check,
+                "creation_surface": creation_surface,
             }
             if not replace_existing:
                 add_monitor_kwargs["replace_existing"] = False

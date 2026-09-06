@@ -309,7 +309,7 @@ def check_provider_path_component_windows(
         raise ValueError(f"{label} can be replaced by {joined}")
 
 
-def validate_provider_executable(candidate: str) -> str:
+def validate_provider_executable(candidate: str, *, require_protected: bool = False) -> str:
     """Return the canonical path of a provider CLI we will run, or raise.
 
     Default policy — *if `gh` works in your terminal, it works here*. Any
@@ -335,7 +335,9 @@ def validate_provider_executable(candidate: str) -> str:
 
     Set ``KIROCREW_PROVIDER_BIN_STRICT=1`` on shared or multi-tenant hosts to
     restore the previous rule: canonical, symlink-free, root-owned and
-    unwritable by the gateway user through every parent.
+    unwritable by the gateway user through every parent. Callers that expose
+    provider credentials to the child set ``require_protected`` to apply that
+    rule regardless of the operator's global mode.
 
     On **Windows** the same two questions are answered from the object's ACL
     rather than from ``st_uid`` and the mode bits, which carry no information
@@ -369,7 +371,7 @@ def validate_provider_executable(candidate: str) -> str:
         if geteuid() == 0:
             raise ValueError("provider execution is disabled for a root gateway")
         uid = geteuid()
-    strict = strict_provider_bins()
+    strict = require_protected or strict_provider_bins()
 
     def _check(target: Path, *, label: str) -> None:
         """Dispatch one component to the platform's ownership policy."""

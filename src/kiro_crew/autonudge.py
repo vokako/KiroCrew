@@ -61,6 +61,7 @@ from kiro_crew.monitoring.models import (
     MonitorActionCompletion,
     MonitorActionDisposition,
     MonitorBudgets,
+    MonitorCreationSurface,
     MonitorDecision,
     MonitorDispatchResult,
     MonitorObservationStatus,
@@ -705,7 +706,12 @@ def _locked_file(path: Path, mode: str) -> Iterator[Any]:
             yield fh
 
 
-def infer_monitor(message: str, now: float) -> MonitorState | None:
+def infer_monitor(
+    message: str,
+    now: float,
+    *,
+    creation_surface: MonitorCreationSurface = MonitorCreationSurface.UNKNOWN,
+) -> MonitorState | None:
     """Build a monitor for *message*'s subject, or ``None`` to stay ungated.
 
     ``None`` is the common, safe answer: a loop watching something with no probe
@@ -736,6 +742,7 @@ def infer_monitor(message: str, now: float) -> MonitorState | None:
             target=target.subject,
             objective="review_ready",
             created_ts=now,
+            creation_surface=creation_surface,
         )
     except ValueError:
         # A subject that cannot form a valid monitor is not a reason to refuse
@@ -1367,6 +1374,7 @@ class AutoNudgeService:
         replace_stopped: bool = False,
         self_armed: bool = False,
         loop_id: str | None = None,
+        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
         # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
         # the awaiting caller is cancelled mid-write, a bare await would release
@@ -1395,6 +1403,7 @@ class AutoNudgeService:
                 replace_stopped=replace_stopped,
                 self_armed=self_armed,
                 loop_id=loop_id,
+                creation_surface=creation_surface,
             )
         )
         self._inflight_adds.add(inner)
@@ -1425,6 +1434,7 @@ class AutoNudgeService:
         admission_check: Callable[[], bool] | None = None,
         self_armed: bool = False,
         loop_id: str | None = None,
+        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
         """Create one durable structured record without legacy prompt routing."""
         inner: "asyncio.Task[NudgeLoop]" = asyncio.ensure_future(
@@ -1444,6 +1454,7 @@ class AutoNudgeService:
                 admission_check=admission_check,
                 self_armed=self_armed,
                 loop_id=loop_id,
+                creation_surface=creation_surface,
             )
         )
         self._inflight_adds.add(inner)
@@ -1474,6 +1485,7 @@ class AutoNudgeService:
         admission_check: Callable[[], bool] | None,
         self_armed: bool = False,
         loop_id: str | None = None,
+        creation_surface: MonitorCreationSurface,
     ) -> NudgeLoop:
         created = time.time() if now is None else now
         cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
@@ -1541,6 +1553,7 @@ class AutoNudgeService:
                     target=target,
                     objective=objective,
                     created_ts=created,
+                    creation_surface=creation_surface,
                     budgets=budgets,
                     cadence_secs=cadence,
                     wake_instructions=wake_instructions,
@@ -1610,6 +1623,7 @@ class AutoNudgeService:
         replace_stopped: bool = False,
         self_armed: bool = False,
         loop_id: str | None = None,
+        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
         async with _maintenance_lock(self._base_dir):
             return await self._add_unserialized(
@@ -1626,6 +1640,7 @@ class AutoNudgeService:
                 replace_stopped=replace_stopped,
                 self_armed=self_armed,
                 loop_id=loop_id,
+                creation_surface=creation_surface,
             )
 
     async def _add_unserialized(
@@ -1644,6 +1659,7 @@ class AutoNudgeService:
         replace_stopped: bool = False,
         self_armed: bool = False,
         loop_id: str | None = None,
+        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         async with self._lock:
@@ -1748,7 +1764,9 @@ class AutoNudgeService:
                 # its subject is quiet is invisible to an observation of that
                 # subject; keying that only on the wording of the instruction made a
                 # cadence contract depend on prose.
-                monitor=infer_monitor(message, now) if gate else None,
+                monitor=(
+                    infer_monitor(message, now, creation_surface=creation_surface) if gate else None
+                ),
                 gate=gate,
                 banner=banner,
                 self_armed=self_armed,
@@ -2674,6 +2692,7 @@ class AutoNudgeService:
         budgets: MonitorBudgets | None = None,
         budget_patch: dict[str, int] | None = None,
         wake_instructions: str | None = None,
+        creation_surface: MonitorCreationSurface | None = None,
     ) -> NudgeLoop | None:
         """Patch an active structured record without implicit revival."""
         if budgets is not None and budget_patch is not None:
@@ -2695,6 +2714,8 @@ class AutoNudgeService:
             assert staged_state is not None
             if target is not None:
                 staged_state.target = target
+            if creation_surface is not None:
+                staged_state.creation_surface = creation_surface
             if objective is not None:
                 staged_state.objective = objective
             if cadence_secs is not None:

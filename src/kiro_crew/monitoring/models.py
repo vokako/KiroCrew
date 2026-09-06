@@ -206,6 +206,14 @@ class MonitorDispatchResult(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class MonitorCreationSurface(str, Enum):
+    """Authenticated surface that armed a durable monitor."""
+
+    UNKNOWN = "unknown"
+    DASHBOARD = "dashboard"
+    CHANNEL = "channel"
+
+
 def monitor_frontend_contract() -> dict[str, object]:
     """Return the checked data contract consumed by the dashboard bundle."""
     return {
@@ -353,6 +361,7 @@ class MonitorState:
     target: str
     objective: str
     created_ts: float
+    creation_surface: MonitorCreationSurface = MonitorCreationSurface.UNKNOWN
     version: int = MONITOR_STATE_VERSION
     config_generation: int = 1
     budgets: MonitorBudgets = field(default_factory=MonitorBudgets)
@@ -527,6 +536,8 @@ class MonitorState:
             self.terminal_pending = "blocked" if self.terminal_pending else ""
         if not isinstance(self.budgets, MonitorBudgets):
             raise ValueError("budgets must be MonitorBudgets")
+        if not isinstance(self.creation_surface, MonitorCreationSurface):
+            raise ValueError("creation_surface must be a MonitorCreationSurface")
         if (
             isinstance(self.cadence_secs, bool)
             or not isinstance(self.cadence_secs, int)
@@ -653,6 +664,9 @@ def monitor_state_from_dict(raw: object) -> MonitorState:
     observation_status = values.get("last_observation_status")
     if observation_status is not None:
         values["last_observation_status"] = MonitorObservationStatus(observation_status)
+    creation_surface = values.get("creation_surface")
+    if creation_surface is not None:
+        values["creation_surface"] = MonitorCreationSurface(creation_surface)
     return MonitorState(**values)
 
 

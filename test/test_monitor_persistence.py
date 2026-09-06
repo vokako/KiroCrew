@@ -13,6 +13,7 @@ from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_CADENCE_SECS,
     MonitorBudgets,
+    MonitorCreationSurface,
     MonitorDecision,
     MonitorObservationStatus,
     MonitorOutcome,
@@ -126,6 +127,23 @@ def test_structured_monitor_cadence_defaults_without_changing_legacy_loop() -> N
     assert monitor.cadence_secs == DEFAULT_MONITOR_CADENCE_SECS == 300
     assert monitor_state_from_dict(monitor_state_to_dict(monitor)).cadence_secs == 300
     assert NudgeLoop(id="legacy02", slot_key="chat-1-123", message="keep going").idle_secs == 60
+
+
+def test_monitor_creation_surface_is_durable_and_legacy_records_fail_closed() -> None:
+    monitor = MonitorState(
+        kind="bitbucket_pull_request",
+        target="bitbucket.org/acme/widgets#10",
+        objective="review_ready",
+        created_ts=1_000.0,
+        creation_surface=MonitorCreationSurface.CHANNEL,
+    )
+
+    restored = monitor_state_from_dict(monitor_state_to_dict(monitor))
+    assert restored.creation_surface is MonitorCreationSurface.CHANNEL
+
+    legacy = monitor_state_to_dict(monitor)
+    legacy.pop("creation_surface")
+    assert monitor_state_from_dict(legacy).creation_surface is MonitorCreationSurface.UNKNOWN
 
 
 def test_structured_monitor_cadence_must_be_a_positive_integer() -> None:
