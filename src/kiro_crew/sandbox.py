@@ -206,6 +206,16 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # ``apps/aws-control/``: a mask covers the leaf, not its ancestors, and an
     # agent-writable ancestor could be renamed out from under it mid-transfer.
     "aws-control-staging",
+    # Quarantine markers for auto-improvement clones whose provisional rollback AND
+    # retirement both failed. Each marker is the only durable record that a clone still
+    # carrying a REFUSED, unscanned commit must never be reused, and the process it has to
+    # outlive is an agent's: masked so a reviewer's shell cannot plant, rewrite or delete
+    # one. Nothing in-sandbox reads it -- the marker is written and consulted host-side by
+    # `auto_improvement.backend.clone_setup` -- so HIDDEN rather than READONLY. A TOP-LEVEL
+    # leaf for the `aws-control-staging` reason: a mask covers the leaf, not its ancestors,
+    # and a marker under `apps/auto-improvement/data/` would sit below a directory an agent
+    # can rename out from under the mount.
+    "quarantined-clones",
     "apps/meetings/data/edits",
     "whatsapp",
     # The refused-inbound spool. Fenced from agent FILE TOOLS by
@@ -609,7 +619,10 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
 #: same-UID agent can swap the transfer's destination for a link. Materialised
 #: (empty, 0o700) before every namespace spawn instead, so the mask always has a
 #: name to bind over.
-_CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = ("aws-control-staging",)
+_CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
+    "aws-control-staging",
+    "quarantined-clones",
+)
 
 #: What a materialised ceiling holds — the empty JSON object every reader above
 #: already treats as its absent default. NOT a zero-byte file, which is not valid

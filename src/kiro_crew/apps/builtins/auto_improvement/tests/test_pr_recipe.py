@@ -560,24 +560,48 @@ class TestEveryPushPathScansContent:
         tip of — so ``git diff <branch>..HEAD`` compared a ref to itself and returned
         nothing, and the fail-closed credential scan passed on a 0-byte input. Measured:
         a commit adding an AWS key gave a 0-byte ``<branch>..HEAD`` diff and a 144-byte
-        ``HEAD~1..HEAD`` diff. Pin the source so the self-diffing range cannot return.
+        single-commit diff. Pin the source so the self-diffing range cannot return.
         Raised by the GPT review of this branch.
+
+        The range now lives in ``Driver._revision_scans_clean``, which both publish paths
+        call, and is built from an explicit REVISION rather than from ``HEAD``: the
+        object scanned and the object pushed have to be the same one by construction, and
+        ``HEAD`` is re-resolved by every step that touches it. So this pins the
+        single-commit SHAPE on the parameterised range, and additionally pins that the range
+        is not built from ``HEAD`` — which the original spelling would have allowed.
         """
         import inspect
+        import re
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._direct_push)
-        assert "HEAD~1..HEAD" in src, "the push scan no longer diffs the committed range"
+        scan_src = inspect.getsource(Driver._revision_scans_clean)
+        assert (
+            'f"{rev}~1..{rev}"' in scan_src
+        ), "the push scan no longer diffs the committed range as a single commit"
+
+        def _code_only(text: str) -> str:
+            return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+        scan_code = _code_only(scan_src)
         # The buggy construct was `scan_range = f"{dest}..HEAD"` fed to `git diff`. Match the
         # CODE, not a mention in a comment: an f-string building a `<var>..HEAD` diff range.
-        import re
-
-        code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
-        code = "\n".join(code_lines)
         assert not re.search(
-            r'f"\{[A-Za-z_]+\}\.\.HEAD"', code
+            r'f"\{[A-Za-z_]+\}\.\.HEAD"', scan_code
         ), "a self-diffing f-string scan range is back in the code"
+        # And the range must not be anchored on HEAD at all: a symbolic ref is resolved by
+        # each git call separately, so a concurrent writer can make the scanned object and
+        # the published object differ.
+        assert (
+            "HEAD~1..HEAD" not in scan_code
+        ), "the scan range is anchored on HEAD again, so it is not bound to the pushed object"
+
+        # `_direct_push` must delegate rather than re-growing its own range.
+        push_code = _code_only(inspect.getsource(Driver._direct_push))
+        assert "_revision_scans_clean(" in push_code, "the push path does not scan its content"
+        assert not re.search(
+            r'f"\{[A-Za-z_]+\}\.\.HEAD"', push_code
+        ), "a self-diffing f-string scan range is back in the push path"
 
     def test_a_committed_secret_is_actually_in_the_scanned_range(self, tmp_path) -> None:
         """End to end against a real repo: the range the driver scans for a one-commit
