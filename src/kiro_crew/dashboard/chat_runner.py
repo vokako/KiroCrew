@@ -103,6 +103,7 @@ from kiro_crew.dashboard.chat_utils import (
     _remove_queued_by_id,
     _validate_tool_name,
     build_recovery_requeue,
+    discard_slot_replay,
     effective_session_key,
     expire_slack_options,
     is_harness_slash_command,
@@ -3233,13 +3234,13 @@ def _redaction_notice(cred_count: int, url_count: int) -> str:
     prefix), so naming one would print a marker the user cannot find in the text
     whenever the substitution came from a different pass.
 
-    The wording is BY KIND because the remedies differ -- issue #8132: telling a
+    The wording is BY KIND because the remedies differ: telling a
     user whose URL was rewritten that "a credential was replaced; supply the
     secret yourself" names a remedy that cannot help them. A credential needs
     the secret re-entered where the command runs; a rewritten URL needs the
     original link re-checked from a trusted source. The second sentence stays
     deliberately blunt either way: a redacted command is not a working command
-    (issue #6189's reporter lost time to an opaque ``getaddrinfo EAI_AGAIN`` far
+    (a user who hit this lost time to an opaque ``getaddrinfo EAI_AGAIN`` far
     from the real cause). At least one count must be non-zero -- the caller
     gates on that.
     """
@@ -3278,10 +3279,10 @@ def _append_redaction_notice(slot: _ChatSlot, redacted: str) -> None:
     deliberately not in that list: they rewrite only what crosses WS/SSE, and
     ``assistant_text`` is accumulated independently of them.
 
-    Tell the user the text was altered. Until #6189 this was silent: the
-    redactors' warnings are logged and nothing else, so a user copied a command
-    whose credential had become a placeholder (issue #6189) or whose URL had
-    been rewritten (issue #8132) and only found out when it failed downstream.
+    Tell the user the text was altered. Without this the rewrite is silent: the
+    redactors' warnings are logged and nothing else, so a user copies a command
+    whose credential has become a placeholder or whose URL has been rewritten
+    and only finds out when it fails downstream.
 
     The counts come from the TAGS in the persisted text, not from the redactors'
     returned warnings, because on the streaming path those warning lists are
@@ -3299,12 +3300,12 @@ def _append_redaction_notice(slot: _ChatSlot, redacted: str) -> None:
     ``EXFILTRATION_REDACTION_TAG_PREFIX`` prefix because that tag interpolates
     the redacted domain and so has no constant form to equality-compare (the
     substitution is built FROM the exported prefix, so the two cannot drift).
-    Enumerating tags by hand here is what previously left an
+    Enumerating tags by hand here is what would leave an
     encoded-credential-only segment silently rewritten and undercounted a mixed
     one; asking the redactor's own module means a newly added tag cannot escape.
 
-    SCOPE: both body rewriters -- ``redact_credentials`` (issue #6189) and
-    ``redact_exfiltration_urls`` (issue #8132), worded by kind because the
+    SCOPE: both body rewriters -- ``redact_credentials`` and
+    ``redact_exfiltration_urls``, worded by kind because the
     remedies differ. Display-string redactions (titles, tool names, feed
     strings, stashed variants -- not text the user copies commands from) stay
     notice-free, deliberately.
@@ -3396,7 +3397,7 @@ def _flush_segment(
         last_msg["variants"] = pending_list
         last_msg["variant_idx"] = len(pending_list) - 1
         slot._pending_variants = []
-    # Tell the user the text was altered (issues #6189 and #8132); shared with
+    # Tell the user the text was altered; shared with
     # the exception-path persists via `_append_redaction_notice` so all eight
     # persists carry one notice contract. The notice broadcasts unconditionally
     # even under `quiet_persist`: that flag exists to suppress a DUPLICATE of the
@@ -9792,6 +9793,12 @@ async def _run_chat(
                         assistant_text = ""
                         _wsred.reset()
             elif event.kind == EVENT_CLEAR_STATUS:
+                # dashboard.replay_from_acp: the transcript is being wiped, so
+                # the resume replay the live provider still holds must go with
+                # it (frames, merge cache, cursor space) -- otherwise the next
+                # detail fetch rebuilds the cleared conversation from those
+                # frames. Same discipline as rewind / regenerate / edit-resend.
+                discard_slot_replay(state.sessions, slot)
                 slot.messages.clear()
                 # The boundary was captured against the pre-clear message
                 # count; the list is now empty, so reset it to 0 or the

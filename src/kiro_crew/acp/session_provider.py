@@ -764,6 +764,27 @@ class AcpSessionProvider(LLMProvider):
     def resumed(self, value: bool) -> None:
         self._resumed_flag = value
 
+    @property
+    def replay_updates(self) -> list[dict[str, Any]]:
+        """The session/update frames kiro-cli replayed on resume (wire order).
+
+        Empty unless the owning runtime captured them (dashboard.replay_from_acp)
+        AND this session came up through session/load. A fresh session/new has
+        nothing to replay, so an empty list is also what a brand-new
+        conversation reports.
+        """
+        return list(getattr(self._handle, "replay_updates", None) or [])
+
+    def discard_replay(self) -> None:
+        """Forget the frames kiro-cli replayed on resume (transcript was rewritten)."""
+        discard = getattr(self._handle, "discard_replay", None)
+        if callable(discard):
+            # The handle also returns the frames' bytes to the runtime's
+            # process-wide retention budget.
+            discard()
+        elif hasattr(self._handle, "replay_updates"):
+            self._handle.replay_updates = []
+
     def set_resume_session_id(self, sid: str) -> None:
         """Store a session ID for future resume via session/load."""
         self._resume_session_id = sid
