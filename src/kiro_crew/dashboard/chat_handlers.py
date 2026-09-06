@@ -36,6 +36,7 @@ from kiro_crew.config.loader import (
     default_project_dir,
     published_autocompact_pct,
     resolve_agent_bindings,
+    session_project_dir,
 )
 from kiro_crew.dashboard import remote_mirror
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
@@ -218,6 +219,129 @@ def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
         )
 
 
+async def _apply_per_session_project(slot, cfg, workspace: str) -> bool:
+    """Give ``slot`` its own project directory when the opt-in is on.
+
+    Called from ONE path: the create endpoint, and only for a slot that endpoint
+    just minted. A reopen of an existing slot is excluded at the call site, where
+    the reason is recorded: such a slot can already have a live provider whose
+    cwd this cannot change. The message-send endpoint also
+    auto-creates slots, but deliberately does NOT call this - an auto-created
+    slot's workspace is ``"default"`` there, and resolving the real one from the
+    requested agent's bindings needs the final project directory, which needs the
+    workspace: a circular dependency traced in the send handler's own comment. So
+    a session first created by a send to an unknown name falls back to the shared
+    default rather than getting a directory under the wrong workspace root.
+
+    No-ops unless the slot has no project yet, so an explicit project, a
+    folder-inherited one, and a metadata-restored one are all left alone. Any
+    failure resolving or creating the directory yields ``""`` and leaves the
+    project unset for the caller's normal fallback chain - the same
+    degrade-rather-than-wedge posture the configured-default branch takes for an
+    ineligible path.
+
+    Reuse is prevented inside ``session_project_dir`` rather than by a predicate
+    here: it creates the directory EXCLUSIVELY, so an existing path is refused
+    instead of adopted. That covers every reusable-key case at once - a
+    caller-supplied name, a channel key, or a minted key reproduced by a closed
+    session plus a same-second restart - without either call site classifying
+    keys. An earlier revision gated on ``_slot_index_from_key``, which only
+    checks that the second segment is a digit and never validates the trailing
+    timestamp, so ``worker-1-stable`` passed an "auto-minted only" test while
+    being entirely reusable.
+
+    Note what does NOT justify any of this: ``slot.project`` IS persisted, on the
+    transcript's metadata line, and is rehydrated from there. A restored session
+    is served from metadata and never re-derives, which is exactly why refusing
+    an existing directory is safe.
+
+    Config is read with ``getattr`` and the dataclass defaults, NOT bare
+    attribute access. Measured: 36 sites across 19 test files patch
+    ``KiroCrewConfig.load`` with a minimal ``dashboard=SimpleNamespace(...)``
+    carrying only the fields the surrounding code reads, so a bare read of a
+    newly added field raises ``AttributeError`` inside the request handler and
+    becomes a 500. That says ``cfg.dashboard`` arriving here is routinely a
+    partial stand-in - the same reason the ``cfg`` guard exists. A missing field
+    defaulting to OFF is the documented default, so this is correct behaviour
+    rather than a mask.
+
+    Returns True ONLY when this call assigned ``slot.project``, and the caller
+    must force a durable save when it does. Assignment alone is in-memory: the
+    caller's own save is conditional on other supplied metadata, and an ordinary
+    create supplies none of it -- the dashboard's own new-chat request carries no
+    folder, no pinned title and no peer key -- so the assignment lands with
+    nothing persisting it, and a crash before the next periodic flush loses the
+    association while the directory, and whatever the session wrote into it, stay
+    on disk with nothing pointing at them. Every other exit returns False,
+    including a follower that found the project already assigned and the
+    compare-and-set losing to a concurrent writer: each of those has an owner
+    that handles its own persistence, and reporting True would attribute their
+    value to this call.
+
+    The transaction is serialised per slot on ``slot._project_init_lock``, so a
+    duplicate create reuses the winner's directory instead of deriving a second
+    one -- see the lock's own comment in ``state.py`` for what deriving twice
+    costs.
+    """
+    if slot.project or not cfg:
+        return False
+    # Guard the WHOLE access chain, not just the leaf fields. Hardening
+    # `new_project_per_session` alone still left `cfg.dashboard` itself bare, and
+    # the send path sees config stand-ins with no `dashboard` attribute at all -
+    # which raised `AttributeError` inside the handler and became a 500 on an
+    # endpoint whose contract is to fail closed with 400/409.
+    dash = getattr(cfg, "dashboard", None)
+    if dash is None or not getattr(dash, "new_project_per_session", False):
+        return False
+    # Serialise the whole transaction on this slot. Two creates naming one slot
+    # key -- a double submit, a client retry -- otherwise both pass the check
+    # above and both derive: the loser's exclusive create meets the winner's
+    # directory, gets nothing back, and returns False, at which point the
+    # caller's fallback chain puts the slot on the SHARED default. If that
+    # fallback commits before the winner's assignment, the compare-and-set below
+    # correctly declines to overwrite it, and the outcome is a slot on the shared
+    # directory with the winner's private one orphaned -- isolation silently lost
+    # in the ordinary duplicate-request case, which is the opposite of what the
+    # opt-in promises. Holding the lock makes the follower wait and then find the
+    # project already assigned, so it reuses the winner's directory by no-oping.
+    #
+    # The re-check inside is not redundant with the one above: the value that
+    # matters is the one final when the lock is held, and for the follower that
+    # is the winner's committed assignment.
+    async with slot._project_init_lock:
+        if slot.project:
+            return False
+        # `slot.key`, NOT any caller-supplied name: the dashboard's own new-chat
+        # path sends no name at all, so a name-derived directory would be missing
+        # on the exact flow the setting exists for. `slot.key` is always present.
+        per_session = await asyncio.to_thread(
+            session_project_dir,
+            slot.key,
+            getattr(dash, "session_project_root", ""),
+            workspace,
+        )
+        if not per_session:
+            return False
+        conflict = await asyncio.to_thread(voice_runtime_workspace_conflict, per_session)
+        if conflict is not None:
+            return False
+        # Compare-and-set at the commit point, NOT a bare assignment. The lock
+        # above serialises this helper against ITSELF, but a concurrent project
+        # POST does not take it, and this still awaits twice (the derivation and
+        # the conflict scan), so an explicit selection can land while we wait.
+        # Committing unconditionally would clobber that selection with a derived
+        # default - the weaker value overwriting the stronger one. So re-read the
+        # field and write ONLY if it is still the empty value we derived from; if
+        # a concurrent writer filled it, yield and leave their selection
+        # standing. This is the root of the whole class of ordering bugs in this
+        # feature's call sites: trust the value that is final at commit time, not
+        # the one captured before the await.
+        if not slot.project:
+            slot.project = per_session
+            return True
+        return False
+
+
 async def api_chat(request: web.Request) -> web.StreamResponse:
     """POST /api/chat — send message to a slot, stream response via SSE."""
     state: DashboardState = request.app["state"]
@@ -374,6 +498,28 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     denied = deny_non_owner_remote_operation(request, slot, "chat_send")
     if denied is not None:
         return denied
+    # This endpoint also creates slots, but the per-session project is
+    # deliberately NOT derived here, and the reason is an ordering constraint in
+    # the code below rather than caution.
+    #
+    # The derivation needs the session's WORKSPACE. An auto-created slot has not
+    # got a meaningful one - `get_or_create_slot` above is called with no
+    # workspace, so it is `"default"` regardless of the agent the request names -
+    # and the real workspace comes from that agent's bindings. But
+    # `resolve_agent_bindings` (below) documents that the project directory it is
+    # given "must be the same directory Kiro Crew passes as the kiro-cli cwd",
+    # because passing a directory the session does not run in reintroduces the
+    # silent agent-substitution bug that lookup exists to prevent. So bindings
+    # need the final project, and deriving the project needs the bindings'
+    # workspace: circular.
+    #
+    # Deriving here anyway - which an earlier revision did - put the directory
+    # under the DEFAULT workspace root whenever the root is unconfigured and the
+    # request named a non-default agent, and persisted that wrong location on the
+    # transcript's metadata line. Not deriving degrades to the shared default,
+    # which is exactly today's behaviour and the point of the opt-in being off by
+    # default. A session created through the create endpoint, where the workspace
+    # is resolved before the derivation, is unaffected.
     # The member-pin refusal sits AFTER the app-ownership 404s (a 409 here
     # for an app would be an existence oracle for slots it may not see) and
     # BEFORE the _human_seen attendance mark, so a denied request leaves the
@@ -2728,6 +2874,41 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # it and continue to use the project endpoint for scope changes.
         if folder_project and folder_applied and not slot.project:
             slot.project = folder_project
+        # Opt-in: give each new session its own project directory so
+        # unrelated concurrent work stops sharing one. Default OFF, so until a
+        # user turns it on the fallback chain below is reached exactly as
+        # before. A folder-linked slot keeps the project it just inherited
+        # above -- that inheritance is server-owned and explicit, so it
+        # outranks a derived default.
+        #
+        # The reasoning lives on `_apply_per_session_project`. This is its only
+        # caller: the message-send path also creates slots but deliberately does
+        # not derive (see the circular-dependency note there).
+        #
+        # GATED ON `is_new_slot`, and that gate is load-bearing rather than a
+        # scope preference. This endpoint also serves a REOPEN of a slot that
+        # already exists, and such a slot may already have a live provider
+        # running in the shared directory. Assigning a project here changes only
+        # in-memory metadata: the provider keeps the cwd it started with, so the
+        # session would advertise a private directory while its files continue
+        # landing in the shared one -- isolation reported but not delivered, and
+        # the mixed files are not recoverable afterwards. The dedicated
+        # workspace-switch handler tears the live session down for exactly this
+        # reason (`_reset_slot_session_or_warn`), which is a correct thing to do
+        # on an explicit switch and the wrong thing to do on a reopen that the
+        # user did not ask to restart. A newly minted slot has no provider yet --
+        # `schedule_eager_spawn` runs at the end of this handler, after the
+        # project is final -- so on that path the cwd and the metadata agree by
+        # construction. An existing projectless slot keeps the shared default,
+        # which is this feature's documented degrade posture.
+        #
+        # The return value feeds the durable save below. A derived directory is
+        # only reachable again through the persisted assignment -- nothing
+        # re-derives it -- so the save has to be forced by the assignment
+        # itself, not left to whatever metadata the request happened to carry.
+        per_session_project_applied = False
+        if is_new_slot:
+            per_session_project_applied = await _apply_per_session_project(slot, cfg, workspace)
         # Default project to workspace directory so file search works out of the box
         if not slot.project:
             cfg_proj = cfg.dashboard.default_project if cfg else ""
@@ -2747,7 +2928,26 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 cfg_proj = resolved if eligible else ""
             else:
                 cfg_proj = ""
-            slot.project = cfg_proj or default_project_dir(workspace)
+            # Commit under the same per-slot lock the derivation takes, because
+            # the lock's job is deciding THIS SLOT's project and the fallback is
+            # the other half of that decision. Two overlapping creates on one key
+            # split into a winner that mints the slot and a follower that does
+            # not, and only the winner runs the derivation. Committing here
+            # unlocked lets the follower read the field during the winner's await
+            # window, find it empty, and install the shared default; the winner's
+            # compare-and-set then correctly declines to overwrite, so the slot
+            # runs in the shared directory while the private one it exclusively
+            # created is orphaned. Waiting makes the follower observe the
+            # winner's choice instead of racing it.
+            #
+            # The value is computed above, OUTSIDE the lock: it depends on config
+            # and the workspace, never on the slot, so two callers compute the
+            # same answer and only the commit needs ordering. The re-read inside
+            # is the authoritative one, since the field can be filled while this
+            # coroutine waits.
+            async with slot._project_init_lock:
+                if not slot.project:
+                    slot.project = cfg_proj or default_project_dir(workspace)
         _sync_dashboard_slots(state)
         # Persist INSIDE the suspension, ahead of the coalesced broadcast, the
         # same ordering `session_control.py`'s create span uses ("the whole
@@ -2780,7 +2980,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # A pinned title must persist too (not just a folder move): without the
         # write, a restart rehydrates the previous title with a refreshable
         # "auto" origin and the background refresh may rewrite the pin.
-        if folder_id or title or remote_slot_key:
+
+        # A per-session project directory assigned above persists on the same
+        # write, and is the reason this condition is not just the three supplied
+        # metadata fields. An ordinary create sends none of them -- the
+        # dashboard's own new-chat request carries no folder, title or peer
+        # key -- and that is exactly the request that assigns a directory and
+        # would otherwise save nothing.
+        if folder_id or title or remote_slot_key or per_session_project_applied:
             # The create/recreate request has been authorized against this
             # transcript.  Do not let a rebind while the off-loop write waits on
             # the history lock redirect its newly supplied metadata to another

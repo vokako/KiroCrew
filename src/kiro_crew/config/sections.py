@@ -2748,6 +2748,25 @@ class DashboardConfig:
             "Directory path used as the project for new chat tabs. Empty = workspace dir.",
         ),
     )
+    new_project_per_session: bool = field(
+        default=False,
+        metadata=_meta(
+            "New Project Per Session",
+            "Give each new chat session its own project directory instead of "
+            "sharing one. Off by default: until it is turned on, new sessions "
+            "resolve their project exactly as before.",
+        ),
+    )
+    session_project_root: str = field(
+        default="",
+        metadata=_meta(
+            "Session Project Root",
+            "Directory that holds the per-session project directories created "
+            "when 'New Project Per Session' is on. Must already exist. "
+            "Empty = the workspace directory. Config-file only, like "
+            "'Default Project' -- no dashboard-writable setting takes a path.",
+        ),
+    )
     theme_mode: str = field(
         default="",
         metadata=_meta(

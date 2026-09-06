@@ -3354,6 +3354,7 @@ class _ChatSlot:
         "_fork_lock",
         "_model_pick_lock",
         "_remote_pick_lock",
+        "_project_init_lock",
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
@@ -3892,6 +3893,24 @@ class _ChatSlot:
         # await, so it gets its own lock rather than blocking every window edit
         # on the tunnel's round-trip.
         self._remote_pick_lock: asyncio.Lock = asyncio.Lock()
+        # Serialises DECIDING this slot's project directory -- both halves: the
+        # per-session derivation (derive -> exclusive create -> conflict scan ->
+        # assign) and the shared-default fallback that runs when no derivation
+        # happened. Two overlapping creates on one slot key split into a winner
+        # that mints the slot and a follower that does not, and only the winner
+        # derives. Without this, the follower installs the shared default during
+        # the winner's await window, the winner's compare-and-set then declines
+        # to overwrite it, and the slot runs in the shared directory while the
+        # private one the winner exclusively created is orphaned -- a duplicate
+        # submit silently costing the isolation the opt-in exists for. Every
+        # writer waits instead, so a follower observes the decision already made
+        # rather than racing it.
+        #
+        # Deliberately NOT ``slot._lock``, for the reason its siblings above
+        # give: that lock guards message-window edits, and this transaction
+        # suspends on a thread hop for the create and another for the
+        # workspace-conflict scan.
+        self._project_init_lock: asyncio.Lock = asyncio.Lock()
         self._tab_id: str = ""  # permanent tab identity for cross-restart session chaining
         # Transcript mtime the in-memory window was last brought up to date
         # against. Only meaningful for a slot bound to a channel session, whose

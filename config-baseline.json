@@ -5898,6 +5898,8 @@
           "enabled": true
         },
         "default_project": "",
+        "new_project_per_session": false,
+        "session_project_root": "",
         "theme_mode": "",
         "sso_login_flags": "",
         "theme_color": "",
@@ -6483,6 +6485,34 @@
       "tags": [],
       "label": "Default Project",
       "help": "Directory path used as the project for new chat tabs. Empty = workspace dir.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "dashboard.new_project_per_session",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "New Project Per Session",
+      "help": "Give each new chat session its own project directory instead of sharing one. Off by default: until it is turned on, new sessions resolve their project exactly as before.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "dashboard.session_project_root",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Session Project Root",
+      "help": "Directory that holds the per-session project directories created when 'New Project Per Session' is on. Must already exist. Empty = the workspace directory. Config-file only, like 'Default Project' -- no dashboard-writable setting takes a path.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
