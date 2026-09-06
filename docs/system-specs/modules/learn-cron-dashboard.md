@@ -1515,6 +1515,9 @@ Every persisted monitor mapping must encode as strict JSON; nested non-finite nu
 and other values accepted only by Python's permissive encoder invalidate the record.
 Timestamp-like integers too large for finite float arithmetic are likewise quarantined
 with a zeroed compatibility timestamp while their exact raw monitor payload is retained.
+If permissive JSON decoding produces a non-strict payload that cannot itself be retained,
+the loader preserves the outer loop and replaces only its monitor view with a sanitized,
+inactive quarantine record; a malformed monitor cannot make the whole loop disappear.
 
 A reasonless inactive update is idempotent for a Research Lab stop tombstone:
 it preserves the source-owned `autonudge_stop` reason until the watchdog
@@ -2099,9 +2102,11 @@ is retained, inactive, and blocked. A persisted `BUSY` claim intentionally has n
 completion deadline and resumes its existing `next_due_ts` retry after restart.
 Future versions also fail closed, are persisted inactive, and are never armed;
 their opaque monitor payload remains preserved for a newer gateway. Malformed
-current-version payloads are replaced once with a valid, inactive
-`invalid_monitor_record` quarantine row, so later restarts do not repeat the
-same repair.
+current-version payloads load through a valid, inactive
+`invalid_monitor_record` quarantine view while retaining their exact strict-JSON
+payload. The loop's active flag and deadline are cleared on the first repair, so
+later restarts remain inert without repeatedly rewriting or destroying budgets,
+counters, provider evidence, or fields understood by a newer gateway.
 Replacing a monitor is committed to the in-memory registry only after its atomic
 snapshot succeeds. A persistence failure restores the previous active record and
 its deadline-backed timer, so a failed create cannot silently stop the watch or
@@ -2465,6 +2470,13 @@ stays disabled until the refreshed reads prove the slot empty.
 Snapshot and mutation failures render through the shared `ErrorNotice` surface.
 Agent hand-off remains disabled because navigation would discard the unsaved
 monitor draft; snapshot retry and mutation retry remain in the editor.
+While a mutation is pending, user-triggered close requests are ignored so a
+late failure cannot hide its error and discard the submitted draft. A successful
+mutation still closes the editor directly after scheduling the authoritative refetch.
+The editor retains drafts and request errors by source monitor (or empty slot) while
+the chat selection changes. A delayed failure is therefore visible with its submitted
+draft when the operator returns to the originating slot, and a delayed success cannot
+close an editor opened for a different slot.
 The legacy-create handoff remains available after a read failure because its
 server-side create-only lock rejects a concurrent record without replacement.
 A live automation frame updates that slot query alongside its Redux upsert. A
@@ -2583,7 +2595,10 @@ remains reachable behind an
 explicit costly label and continues to use `/api/autonudge`, including its
 historical `max_cycles = 0` unlimited meaning. Its popover width is viewport-bounded,
 its content scrolls vertically, and its numeric controls stack at the narrowest
-supported width, so the fallback remains usable at 320 pixels.
+supported width, so the fallback remains usable at 320 pixels. Bounded and legacy
+views share one persistent composer trigger; switching modes replaces only the
+popover body, so the entry control never disappears and reappears under a different
+icon.
 Active-slot hydration reads the legacy record from
 `GET /api/autonudge/slot/{slot}` and the structured record from
 `GET /api/monitors/slot/{slot}`. These snapshots remain in React Query and never

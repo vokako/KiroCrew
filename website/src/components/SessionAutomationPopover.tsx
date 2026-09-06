@@ -14,7 +14,7 @@ import {
 } from '../monitoring/automation'
 import { fmtDateTimeNumeric, fmtNumber } from '../i18n/format'
 import { Badge, Btn, IconButton, Input, SendBtn } from './ui'
-import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
+import { PopoverContent } from './ui/popover'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { i18nT } from '../i18n/t'
 import MonitorRadar from './MonitorRadar'
@@ -53,7 +53,7 @@ type EditorState = {
 
 type FormErrors = Partial<Record<keyof Draft | 'request', string>>
 
-type Mutation = ({ captured: AutomationRecord | null; slotKey: string } & (
+type Mutation = ({ captured: AutomationRecord | null; slotKey: string; editorKey: string } & (
   | { action: 'create'; payload: Required<MonitorWrite> }
   | { action: 'update'; id: string; payload: MonitorWrite }
   | { action: 'stop'; id: string }
@@ -131,48 +131,56 @@ export default function SessionAutomationPopover({
   sessionMode = '',
 }: Props) {
   const monitor = automation?.kind === 'structured_monitor' ? automation : null
-  const [legacyMode, setLegacyMode] = useState(automation?.kind === 'legacy_goal_loop')
-  const [editor, setEditor] = useState<EditorState>(() => ({
+  const [legacyModeSlot, setLegacyModeSlot] = useState<string | null>(
+    automation?.kind === 'legacy_goal_loop' ? slotKey : null,
+  )
+  const editorKey = monitor?.id ?? `new:${slotKey}`
+  const incomingEditor = (): EditorState => ({
     draft: monitor ? monitorDraft(monitor) : defaults(),
     dirty: {},
-    sourceId: monitor?.id ?? `new:${slotKey}`,
+    sourceId: editorKey,
+  })
+  const [editors, setEditors] = useState<Record<string, EditorState>>(() => ({
+    [editorKey]: incomingEditor(),
   }))
-  const [errors, setErrors] = useState<FormErrors>({})
+  const [errorsByEditor, setErrorsByEditor] = useState<Record<string, FormErrors>>({})
+  const editor = editors[editorKey] ?? incomingEditor()
+  const errors = errorsByEditor[editorKey] ?? {}
   const [confirmStop, setConfirmStop] = useState(false)
   const id = useId()
   const queryClient = useQueryClient()
   const snapshotFetching = useIsFetching({ queryKey: ['session-automation', slotKey], exact: true }) > 0
   const automationRef = useRef(automation)
   automationRef.current = automation
+  const slotKeyRef = useRef(slotKey)
+  slotKeyRef.current = slotKey
   const sessionModeUnsupported = sessionMode === 'crew' || sessionMode === 'member'
+  const legacyView = automation?.kind === 'legacy_goal_loop' || legacyModeSlot === slotKey
 
   useEffect(() => {
     if (!open) return
-    setLegacyMode(automation?.kind === 'legacy_goal_loop')
+    if (automation?.kind === 'legacy_goal_loop') setLegacyModeSlot(slotKey)
     setConfirmStop(false)
-    setErrors({})
-  }, [open, automation?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, automation?.id, automation?.kind, slotKey])
 
   useEffect(() => {
-    if (!open) {
-      setEditor(current => current.sourceId === null
-        ? current
-        : { ...current, dirty: {}, sourceId: null })
-      return
-    }
-    const sourceId = monitor?.id ?? `new:${slotKey}`
+    if (!open) return
     const incoming = monitor ? monitorDraft(monitor) : defaults()
-    setEditor(current => {
-      if (current.sourceId !== sourceId) {
-        return { draft: incoming, dirty: {}, sourceId }
+    setEditors(current => {
+      const currentEditor = current[editorKey]
+      if (!currentEditor || currentEditor.sourceId !== editorKey) {
+        return {
+          ...current,
+          [editorKey]: { draft: incoming, dirty: {}, sourceId: editorKey },
+        }
       }
-      const draft = { ...current.draft }
+      const draft = { ...currentEditor.draft }
       for (const field of DRAFT_FIELDS) {
-        if (!current.dirty[field]) draft[field] = incoming[field]
+        if (!currentEditor.dirty[field]) draft[field] = incoming[field]
       }
-      return { ...current, draft }
+      return { ...current, [editorKey]: { ...currentEditor, draft } }
     })
-  }, [open, monitor, slotKey])
+  }, [editorKey, monitor, open])
 
   const mutation = useMutation({
     mutationFn: (request: Mutation) => {
@@ -192,52 +200,70 @@ export default function SessionAutomationPopover({
       // safely accept the bounded response; a null create identity cannot be
       // distinguished from a later clear tombstone.
       queryClient.invalidateQueries({ queryKey: ['session-automation', request.slotKey] })
-      onOpenChange(false)
+      setEditors(current => {
+        const next = { ...current }
+        delete next[request.editorKey]
+        return next
+      })
+      setErrorsByEditor(current => {
+        const next = { ...current }
+        delete next[request.editorKey]
+        return next
+      })
+      if (slotKeyRef.current === request.slotKey) onOpenChange(false)
     },
-    onError: () => {
-      setErrors({ request: i18nT('components.sessionAutomationPopover.request_failed') })
+    onError: (_error, request) => {
+      setErrorsByEditor(current => ({
+        ...current,
+        [request.editorKey]: {
+          request: i18nT('components.sessionAutomationPopover.request_failed'),
+        },
+      }))
     },
   })
-
-  if (legacyMode || automation?.kind === 'legacy_goal_loop') {
-    return (
-      <AutoNudgePopover
-        slotKey={slotKey}
-        loop={automation?.kind === 'legacy_goal_loop' ? legacyWire(automation) : null}
-        open={open}
-        onOpenChange={onOpenChange}
-        onChange={loop => {
-          if (automationRef.current !== automation) return
-          onChange(loop ? normalizeAutomationRecord(loop) : null)
-        }}
-        onBackToBoundedMonitor={automation?.kind === 'legacy_goal_loop'
-          ? undefined
-          : () => setLegacyMode(false)}
-        writeDisabled={sessionModeUnsupported}
-        interrupted={interrupted}
-      />
-    )
-  }
 
   const terminal = monitor?.terminal ?? null
   const status = monitor ? deriveAutomationStatus(monitor) : 'arm_pending'
   const statusLabel = i18nT(MONITOR_STATUS_KEYS[status])
-  const busy = mutation.isPending
+  const legacyLoop = automation?.kind === 'legacy_goal_loop' ? automation : null
+  const legacyCycle = legacyLoop?.maxCycles
+    ? `${legacyLoop.cycleCount}/${legacyLoop.maxCycles}`
+    : String(legacyLoop?.cycleCount ?? 0)
+  const triggerLabel = legacyLoop?.active
+    ? i18nT(
+      interrupted
+        ? 'components.autoNudgePopover.goal_interrupted_cycle'
+        : 'components.autoNudgePopover.goal_active_cycle',
+      { cycle: legacyCycle },
+    )
+    : monitor
+      ? i18nT('components.sessionAutomationPopover.monitor_status', { status: statusLabel })
+      : i18nT('components.sessionAutomationPopover.set_up_bounded_monitor')
+  const busy = mutation.isPending && mutation.variables?.editorKey === editorKey
   const draft = editor.draft
   const hasDirtyFields = Object.keys(editor.dirty).length > 0
 
+  function requestOpenChange(nextOpen: boolean) {
+    if (!nextOpen && busy) return
+    onOpenChange(nextOpen)
+  }
+
   function updateDraft(field: keyof Draft, value: string) {
-    setEditor(current => ({
+    setEditors(current => ({
       ...current,
-      draft: { ...current.draft, [field]: value },
-      dirty: { ...current.dirty, [field]: true },
+      [editorKey]: {
+        ...(current[editorKey] ?? incomingEditor()),
+        draft: { ...(current[editorKey] ?? incomingEditor()).draft, [field]: value },
+        dirty: { ...(current[editorKey] ?? incomingEditor()).dirty, [field]: true },
+      },
     }))
-    setErrors(current => {
-      if (!current[field] && !current.request) return current
-      const next = { ...current }
+    setErrorsByEditor(current => {
+      const slotErrors = current[editorKey] ?? {}
+      if (!slotErrors[field] && !slotErrors.request) return current
+      const next = { ...slotErrors }
       delete next[field]
       delete next.request
-      return next
+      return { ...current, [editorKey]: next }
     })
   }
 
@@ -285,13 +311,13 @@ export default function SessionAutomationPopover({
       )
     }
     if (Object.keys(nextErrors).length > 0) {
-      setErrors(nextErrors)
+      setErrorsByEditor(current => ({ ...current, [editorKey]: nextErrors }))
       const first = Object.keys(nextErrors)[0] as keyof Draft
       const suffix = first === 'providerErrors' ? 'errors' : first
       document.getElementById(`${id}-${suffix}`)?.focus()
       return
     }
-    setErrors({})
+    setErrorsByEditor(current => ({ ...current, [editorKey]: {} }))
     const createPayload = {
       kind: 'github_pull_request' as const,
       objective: 'review_ready' as const,
@@ -309,6 +335,7 @@ export default function SessionAutomationPopover({
         payload: { ...createPayload, slot_key: slotKey },
         captured: automation,
         slotKey,
+        editorKey,
       })
       return
     }
@@ -324,28 +351,45 @@ export default function SessionAutomationPopover({
     if (editor.dirty.wakeInstructions) {
       payload.wake_instructions = createPayload.wake_instructions
     }
-    mutation.mutate({ action: 'update', id: monitor.id, payload, captured: automation, slotKey })
+    mutation.mutate({
+      action: 'update', id: monitor.id, payload, captured: automation, slotKey, editorKey,
+    })
   }
 
   return (
-    <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger asChild>
+    <AutoNudgePopover
+      key={legacyLoop?.id ?? `bounded:${slotKey}`}
+      slotKey={slotKey}
+      loop={legacyLoop ? legacyWire(legacyLoop) : null}
+      open={open}
+      onOpenChange={requestOpenChange}
+      onChange={loop => {
+        if (automationRef.current !== automation) return
+        onChange(loop ? normalizeAutomationRecord(loop) : null)
+      }}
+      onBackToBoundedMonitor={legacyLoop ? undefined : () => setLegacyModeSlot(null)}
+      writeDisabled={sessionModeUnsupported}
+      interrupted={interrupted}
+      trigger={(
         <IconButton
-          aria-label={monitor
-            ? i18nT('components.sessionAutomationPopover.monitor_status', { status: statusLabel })
-            : i18nT('components.sessionAutomationPopover.set_up_bounded_monitor')}
-          variant={monitor?.active ? 'active' : 'default'}
+          aria-label={triggerLabel}
+          variant={monitor?.active || legacyLoop?.active ? 'active' : 'default'}
           className="h-8 px-2 rounded-lg shrink-0"
         >
           <MonitorRadar actionRunning={status === 'action_running'} />
-          {monitor ? <span className="text-[11px] font-mono">{fmtNumber(monitor.usage.probes)}</span> : null}
+          {monitor ? (
+            <span className="text-[11px] font-mono">{fmtNumber(monitor.usage.probes)}</span>
+          ) : legacyLoop?.cycleCount ? (
+            <span className="text-[11px] font-mono">{legacyCycle}</span>
+          ) : null}
         </IconButton>
-      </PopoverTrigger>
-      <PopoverContent
-        side="top"
-        align="start"
-        className="w-[min(calc(100vw-1rem),32rem)] max-h-[min(80vh,42rem)] overflow-y-auto p-4 text-[12px]"
-      >
+      )}
+      content={legacyView ? undefined : (
+        <PopoverContent
+          side="top"
+          align="start"
+          className="w-[min(calc(100vw-1rem),32rem)] max-h-[min(80vh,42rem)] overflow-y-auto p-4 text-[12px]"
+        >
         <div className="flex items-start justify-between gap-3 mb-3">
           <div className="min-w-0">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-text">
@@ -356,7 +400,7 @@ export default function SessionAutomationPopover({
               {i18nT('components.sessionAutomationPopover.description')}
             </p>
           </div>
-          <IconButton aria-label={i18nT('components.sessionAutomationPopover.close')} onClick={() => onOpenChange(false)}>
+          <IconButton aria-label={i18nT('components.sessionAutomationPopover.close')} onClick={() => requestOpenChange(false)}>
             <X className="lucide-inline" aria-hidden />
           </IconButton>
         </div>
@@ -590,7 +634,7 @@ export default function SessionAutomationPopover({
               <Btn
                 type="button"
                 disabled={sessionModeUnsupported}
-                onClick={() => setLegacyMode(true)}
+                onClick={() => setLegacyModeSlot(slotKey)}
               >
                 {i18nT('components.sessionAutomationPopover.use_legacy_costly')}
               </Btn>
@@ -611,6 +655,7 @@ export default function SessionAutomationPopover({
                 id: monitor.id,
                 captured: automation,
                 slotKey,
+                editorKey,
               })}
             >
               <RotateCw className="lucide-inline" aria-hidden /> {i18nT('components.sessionAutomationPopover.restart_monitor')}
@@ -618,7 +663,7 @@ export default function SessionAutomationPopover({
           ) : confirmStop ? (
             <>
               <Btn type="button" disabled={busy} onClick={() => setConfirmStop(false)}>{i18nT('components.sessionAutomationPopover.cancel')}</Btn>
-              <Btn type="button" danger disabled={busy} onClick={() => mutation.mutate({ action: 'stop', id: monitor.id, captured: automation, slotKey })}>{i18nT('components.sessionAutomationPopover.confirm_stop')}</Btn>
+              <Btn type="button" danger disabled={busy} onClick={() => mutation.mutate({ action: 'stop', id: monitor.id, captured: automation, slotKey, editorKey })}>{i18nT('components.sessionAutomationPopover.confirm_stop')}</Btn>
             </>
           ) : (
             <>
@@ -634,7 +679,8 @@ export default function SessionAutomationPopover({
             </>
           )}
         </div>
-      </PopoverContent>
-    </Popover>
+        </PopoverContent>
+      )}
+    />
   )
 }

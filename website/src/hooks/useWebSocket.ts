@@ -2031,6 +2031,7 @@ export function useWebSocket() {
               )
               if (nudge.event === 'removed') {
                 dispatch(removeAutomation(slot))
+                queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
                 break
               }
               const record = normalizeAutomationRecord(nudge)

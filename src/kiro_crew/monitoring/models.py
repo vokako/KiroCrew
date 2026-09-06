@@ -649,6 +649,16 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
     if is_finite_non_negative_number(raw_created_ts):
         assert isinstance(raw_created_ts, (int, float)) and not isinstance(raw_created_ts, bool)
         created_ts = raw_created_ts
+    raw_payload_candidate: dict[str, object] = deepcopy(raw)
+    try:
+        _validate_strict_json_object("_raw_payload", raw_payload_candidate)
+    except ValueError:
+        # Python's permissive JSON decoder accepts non-finite numbers that the
+        # persisted monitor contract forbids. Keep the outer loop and its inert
+        # quarantine view even though that invalid payload cannot be rewritten.
+        raw_payload = None
+    else:
+        raw_payload = raw_payload_candidate
     return MonitorState(
         kind=_identity("kind"),
         target=_identity("target"),
@@ -656,6 +666,7 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         created_ts=created_ts,
         outcome=MonitorOutcome.BLOCKED,
         stopped_reason=MONITOR_STOP_INVALID_RECORD,
+        _raw_payload=raw_payload,
     )
 
 

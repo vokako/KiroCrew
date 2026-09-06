@@ -34,6 +34,7 @@ import type { ChatSlot } from '../types'
 import { recentErrors } from '../utils/errorReport'
 import { structuredMonitorLoop } from './monitorFixtures'
 import { normalizeAutomationRecord } from '../monitoring/automation'
+import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -837,6 +838,21 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().automations[ACTIVE]).toBeUndefined()
+  })
+
+  it('refreshes the full loop registry when a removal frame arrives', () => {
+    const { ws } = mount()
+    const invalidate = vi.spyOn(testQueryClient, 'invalidateQueries')
+    invalidate.mockClear()
+
+    act(() => {
+      ws.simulateMessage({
+        type: 'autonudge_state',
+        data: { event: 'removed', slot: ACTIVE },
+      })
+    })
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
   })
 
   it('removes a structured monitor when its websocket tombstone arrives', () => {

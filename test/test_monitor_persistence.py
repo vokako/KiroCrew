@@ -591,15 +591,63 @@ def test_malformed_monitor_cannot_rearm_after_restart(tmp_path) -> None:
     assert restored.monitor.outcome is MonitorOutcome.BLOCKED
     assert restored.monitor.stopped_reason == "invalid_monitor_record"
     serialized_monitor = service._serialize_state()["loops"][0]["monitor"]
-    assert serialized_monitor["outcome"] == "blocked"
-    assert serialized_monitor["stopped_reason"] == "invalid_monitor_record"
-    assert serialized_monitor["agent_turns"] == 0
+    assert serialized_monitor == malformed_monitor
 
     service._save()
     persisted = json.loads((tmp_path / "autonudge.json").read_text(encoding="utf-8"))
     persisted_monitor = persisted["loops"][0]["monitor"]
-    assert persisted_monitor["outcome"] == "blocked"
-    assert persisted_monitor["stopped_reason"] == "invalid_monitor_record"
+    assert persisted_monitor == malformed_monitor
+
+    reloaded = AutoNudgeService(base_dir=tmp_path)
+    reloaded._load()
+    assert not reloaded._store_dirty
+
+
+def test_unknown_observation_status_is_quarantined_without_losing_raw_evidence(tmp_path) -> None:
+    """A newer classification cannot erase the current record during repair."""
+    malformed_monitor = {
+        "version": 1,
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 1_000.0,
+        "last_observation_status": "future_status",
+        "last_observation": {"head_revision": "abc123", "checks": "failing"},
+        "probe_count": 7,
+        "input_tokens": 12_000,
+        "output_tokens": 3_000,
+        "budgets": {
+            "max_runtime_secs": 7_200,
+            "max_agent_turns": 4,
+            "max_tokens": 80_000,
+            "max_provider_errors": 2,
+        },
+    }
+    store = {
+        "version": 1,
+        "loops": [
+            {
+                "id": "future-classification",
+                "slot_key": "chat-1-123",
+                "message": "inspect the changed pull request",
+                "idle_secs": 300,
+                "active": True,
+                "next_due_ts": 1_500.0,
+                "monitor": malformed_monitor,
+            }
+        ],
+    }
+    path = tmp_path / "autonudge.json"
+    path.write_text(json.dumps(store), encoding="utf-8")
+    service = AutoNudgeService(base_dir=tmp_path)
+
+    service._load()
+    service._save()
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["loops"][0]["active"] is False
+    assert persisted["loops"][0]["next_due_ts"] == 0.0
+    assert persisted["loops"][0]["monitor"] == malformed_monitor
 
     reloaded = AutoNudgeService(base_dir=tmp_path)
     reloaded._load()
@@ -641,8 +689,53 @@ def test_oversized_monitor_timestamp_is_quarantined_without_data_loss(tmp_path) 
     assert restored.monitor.outcome is MonitorOutcome.BLOCKED
     assert restored.monitor.stopped_reason == "invalid_monitor_record"
     serialized_monitor = service._serialize_state()["loops"][0]["monitor"]
-    assert serialized_monitor["outcome"] == "blocked"
-    assert serialized_monitor["stopped_reason"] == "invalid_monitor_record"
+    assert serialized_monitor == malformed_monitor
+
+
+def test_non_finite_monitor_timestamp_is_quarantined_without_dropping_loop(tmp_path) -> None:
+    """Non-strict JSON cannot preserve its payload, but must retain the inert loop."""
+    malformed_monitor = {
+        "version": 1,
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": float("inf"),
+    }
+    store = {
+        "version": 1,
+        "loops": [
+            {
+                "id": "broken-non-finite-timestamp",
+                "slot_key": "chat-1-123",
+                "message": "retain these instructions",
+                "idle_secs": 300,
+                "active": True,
+                "next_due_ts": 1_500.0,
+                "monitor": malformed_monitor,
+            }
+        ],
+    }
+    path = tmp_path / "autonudge.json"
+    path.write_text(json.dumps(store), encoding="utf-8")
+    service = AutoNudgeService(base_dir=tmp_path)
+
+    service._load()
+
+    restored = service._loops["broken-non-finite-timestamp"]
+    assert restored.message == "retain these instructions"
+    assert not restored.active
+    assert restored.next_due_ts == 0.0
+    assert restored.monitor is not None
+    assert restored.monitor.created_ts == 0.0
+    assert restored.monitor.outcome is MonitorOutcome.BLOCKED
+    assert restored.monitor.stopped_reason == "invalid_monitor_record"
+
+    service._save()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["loops"][0]["id"] == "broken-non-finite-timestamp"
+    assert persisted["loops"][0]["message"] == "retain these instructions"
+    assert persisted["loops"][0]["monitor"]["created_ts"] == 0.0
+    json.dumps(persisted, allow_nan=False)
 
 
 def test_malformed_current_outcome_cannot_rearm_after_restart(tmp_path) -> None:
