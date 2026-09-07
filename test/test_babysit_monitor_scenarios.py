@@ -29,10 +29,9 @@ from kiro_crew.monitoring.models import (
 _SESSION_KEY = "dashboard:chat-1"
 _BINDING = "chat-1"
 _TARGET = "https://github.com/acme/widgets/pull/7"
-_BABYSIT_SKILL = (
-    Path(__file__).parents[1] / "src/kiro_crew/builtin_skills/kirocrew-dev/babysit/SKILL.md"
-)
-_SYSTEM_PROMPT = Path(__file__).parents[1] / "src/kiro_crew/config/prompt.md"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_BABYSIT_SKILL = _REPO_ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/babysit/SKILL.md"
+_SYSTEM_PROMPT = _REPO_ROOT / "src/kiro_crew/config/prompt.md"
 
 
 def test_babysit_is_reachable_and_the_system_prompt_prefers_structured_watch() -> None:
