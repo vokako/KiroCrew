@@ -728,7 +728,17 @@ _LITERAL_RE = re.compile(r'"\.kiro"\s*/\s*"agents"' r"|[\"']\.kiro/agents")
 # for that entry, so it cannot reintroduce the reader/writer split-brain this
 # guard exists to catch; ``TestKiroAgentsDirWriteProtection`` pins the literal to
 # ``kiro_agents_dir()`` so drift still fails loudly.
-_ALLOWED = {"config/paths.py", "security/paths.py"}
+_ALLOWED = {
+    "config/paths.py",
+    "security/paths.py",
+    # A third case, and a different kind. The AWS Control crew container runs as its
+    # own process inside a Linux image where ``kiro_crew`` is not importable, so
+    # ``supervisor/bundle.py`` re-implements this resolver rather than calling it.
+    # The exempt file is that module's own TEST, which asserts what the
+    # re-implementation returns against a tmp_path: it neither reads nor writes the
+    # owner's home.
+    "apps/builtins/aws_control/crew/runtime/container_tests/test_supervisor_bundle.py",
+}
 
 
 def test_no_new_hardcoded_global_agents_dir():

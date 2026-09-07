@@ -63,3 +63,15 @@ recursive-include src/kiro_crew/deploy/skills *
 # published Linux wheel ships a vendored llama_cpp that cannot load its own
 # shared library and in-process embeddings fail at gateway startup.
 recursive-include src/kiro_crew/_vendor/llama_cpp_libs *
+# The AWS Control crew container image's build context, re-included AFTER the excludes
+# for the same reason as the block above, and it is the ORDERING that does the work here.
+# `python -m build` builds the wheel from the SDIST, so a file absent from this file is
+# absent from every published wheel whatever `package_data` in setup.cfg says. The tree
+# holds Dockerfiles, `requirements*.txt`, CONTRACT.md and a vendor placeholder, none of
+# which any pattern above reaches: `*` does not cross a path separator, so
+# `recursive-include src/kiro_crew/apps *.md` matches nothing under `crew/runtime/`
+# beyond `.md`, and the Dockerfiles have no extension at all.
+#
+# Without this line the image builds from a source checkout and silently cannot build
+# from an installed copy, with nothing raising at install time to say so.
+recursive-include src/kiro_crew/apps/builtins/aws_control/crew/runtime *
