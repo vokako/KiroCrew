@@ -921,7 +921,7 @@ function inspectCandidate(candidate, { fs, appNames, log = () => {} }) {
  * @returns {{crashLogPath: string, logsDir: string, baseline: boolean,
  *            newCrashes: Array<object>, candidates: number, inspected: number,
  *            skipped: number, deferred: number, unparsed: number, aged: number,
- *            recorded: number}}
+ *            removed: number, recorded: number}}
  */
 function collectCrashReports({
   logsDir,
@@ -947,6 +947,7 @@ function collectCrashReports({
     deferred: 0,
     unparsed: 0,
     aged: 0,
+    removed: 0,
     recorded: 0,
   };
   if (!fs) return summary;
@@ -1065,7 +1066,7 @@ function collectCrashReports({
   const lines = [];
   const records = [];      // outcome `crash`: announced AND acknowledged on write
   const notes = [];        // outcome `unparsed`: acknowledged on write, not announced
-  const provenForeign = []; // outcome `foreign`: acknowledged unconditionally
+  const provenForeign = []; // outcome `foreign`: acknowledged unconditionally, then deleted
   const pendingKeys = [];   // read short THIS run: aged out once the count trips
   for (const candidate of toInspect) {
     let result = null;
@@ -1084,7 +1085,7 @@ function collectCrashReports({
       continue;
     }
     if (result.outcome === INSPECT_FOREIGN) {
-      provenForeign.push(candidate.key);
+      provenForeign.push(candidate);
       continue;
     }
     lines.push(formatCrashLine({ at: result.at, ...result.fields }));
@@ -1106,7 +1107,32 @@ function collectCrashReports({
 
   // Proven-foreign needs no ledger line, so its acknowledgement does not depend
   // on the write landing.
-  for (const key of provenForeign) seen.add(key);
+  //
+  // It is also DELETED, not just acknowledged. Every dump in this database that
+  // is not ours got here because a child process inherited our Crashpad handler
+  // (a Mach exception port on macOS), so the handler faithfully wrote the
+  // child's crash into our `pending/`. Crashpad only prunes a dump it has
+  // uploaded, and `uploadToServer` is off, so nothing ever removes them: one
+  // machine accumulated 585 (129 MB) in four days, a dozen an hour, none of
+  // them this app. Acknowledging alone kept them out of the ledger but left
+  // the leak. Deletion is gated on the same PROOF as the acknowledgement — a
+  // readable dump whose first module is someone else's, or whose exception
+  // code is zero — never on a failure to read. Our own dumps are never touched:
+  // an own-app crash is `records`, an own-app snapshot (code 0) is the one
+  // foreign case that IS ours, and it is a deliberate `DumpWithoutCrashing()`
+  // nobody asked to keep either. Best-effort: an unlink that fails leaves the
+  // dump acknowledged exactly as before, so a read-only database degrades to
+  // the old behaviour rather than to a retry loop.
+  for (const candidate of provenForeign) {
+    seen.add(candidate.key);
+    if (candidate.kind !== "minidump") continue;
+    try {
+      fs.unlinkSync(candidate.filePath);
+      summary.removed += 1;
+    } catch (e) {
+      log(`crash scan could not remove foreign ${candidate.name}: ${e && e.message}`);
+    }
+  }
   if (durable) {
     for (const { candidate, record } of records) {
       seen.add(candidate.key);
@@ -1175,7 +1201,8 @@ function collectCrashReports({
   log(
     `crash scan: candidates=${summary.candidates} new=${summary.newCrashes.length} `
       + `inspected=${summary.inspected} skipped=${summary.skipped} deferred=${summary.deferred} `
-    + `unparsed=${summary.unparsed} aged=${summary.aged} recorded=${summary.recorded}`
+    + `unparsed=${summary.unparsed} aged=${summary.aged} removed=${summary.removed} `
+    + `recorded=${summary.recorded}`
   );
   return summary;
 }
