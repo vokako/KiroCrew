@@ -66,7 +66,7 @@ Metadata only, by design: transcript-derived text never appears in the output,
 so no private session content crosses into the caller's context whatever keys
 the config watches. Content, when a ruling needs it, is read through the
 workspace-authorized session tools.
-    BANNED pid=<pid> rule=<regex> cwd=fleet|unknown
+    BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s
     OK <n> watched, <m> fired | load/cpu <x> (<posture>) | mem <G>G
        | banned <k> | foreign <k> | deliver init-timeout <a>, watchdog <b>
 
@@ -1082,6 +1082,66 @@ def _owner_class(proc_entry: Path, fleet: list[str], cmd: str = "") -> str:
     return "foreign"
 
 
+def _proc_age_secs(proc_root: Path, pid: str) -> int | None:
+    """How many seconds the process at *pid* has been alive, or None.
+
+    The reader problem the age solves: a bare ``BANNED pid=`` line is the same
+    every cycle whether the process the conductor stopped is still running or a
+    new offender holds its recycled number -- pids are recycled, so the number
+    alone cannot tell those apart, and a re-emitted line reads as either
+    "handled, ignore" or "still burning the host" with no way to choose. The
+    process's own age settles it: an age that grows across cycles marks one
+    process still alive; a small age under a recycled number marks a fresh
+    violation. The age is a fact about the running process, so it costs no state
+    file and no second writer -- the probe stays read-only outside
+    ``--mark-handled``.
+
+    Both reads are world-readable like ``/proc/<pid>/cmdline`` (the field this
+    scan trusts), so a process owned by another user answers here even though its
+    ``cwd``/``exe`` links do not. ``proc_root`` is threaded through rather than
+    ``/proc`` hardcoded, so the test harness's ``KIROCREW_PROBE_PROC_ROOT``
+    supplies both files, under the same containment rule as every other path here.
+
+    ``/proc/<pid>/stat`` field 22 is ``starttime`` in clock ticks since boot.
+    The ``comm`` field (field 2) can hold spaces and parentheses, so the parse
+    resumes after the last ``)``; a comm like ``(sh )nasty)`` keeps its own
+    parentheses out of the field split. Any unreadable or malformed input returns
+    None, which the caller renders as ``age=?s`` -- the same handling as an
+    unreadable cwd, and never crashes the scan.
+
+    The source is ``/proc`` plus ``os.sysconf`` for the clock tick rate, both
+    POSIX-only. On a platform without them the age is genuinely uncomputable, so
+    this returns None and the caller emits ``age=?s`` there too. The field is
+    never omitted: a missing field would read as "no age" and let a reader assume
+    the process is new, while ``age=?s`` says the age is unavailable. There is no
+    stdlib-only process create-time source on Windows, so ``age=?s`` is the honest
+    answer rather than a number from a guessed tick rate.
+    """
+    try:
+        stat = (proc_root / pid / "stat").read_text(encoding="ascii", errors="replace")
+        rparen = stat.rindex(")")
+        starttime_ticks = int(stat[rparen + 2 :].split()[19])
+        uptime = float((proc_root / "uptime").read_text(encoding="ascii").split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    # The tick rate converts starttime into seconds and comes from ``os.sysconf``,
+    # which is POSIX-only. Where it is absent there is no reliable rate, so the
+    # age is genuinely uncomputable: return None (rendered ``age=?s``) rather than
+    # guess a rate and print a wrong number. A wrong age reads as a real age, so a
+    # reader trusts it; ``age=?s`` tells them the answer is unavailable.
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (AttributeError, ValueError, OSError):
+        return None
+    if hz <= 0:
+        return None
+    age = uptime - starttime_ticks / hz
+    # A negative age means the two reads disagreed (clock skew, or a pid that
+    # exited and its number was reused between the two opens); clamp to 0 rather
+    # than print a value that reads as nonsense.
+    return int(age) if age >= 0 else 0
+
+
 def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
     """Banned-process lines plus the host summary fragment."""
     banned_res = [
@@ -1163,7 +1223,22 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
                 # The argv is deliberately not echoed: a command line can carry
                 # credentials or presigned URLs, and this line lands in the
                 # conductor's model context.
-                lines.append(f"BANNED pid={entry.name} rule={matched} cwd={cwd_class}")
+                #
+                # ``age=`` is what makes a re-emitted line readable across
+                # cycles: a bare pid cannot say whether the process the conductor
+                # stopped is still running or a new offender holds its recycled
+                # number, so the same line reads as either handled-ignore or
+                # still-burning with no way to choose. A process age that grows
+                # across cycles marks one process still alive; a small age marks a
+                # fresh violation. The age comes from the running process, so it
+                # costs no state and keeps the probe read-only outside
+                # ``--mark-handled``. An unreadable age prints ``age=?s``, like an
+                # unknown cwd, and never blocks the line.
+                age = _proc_age_secs(proc_root, entry.name)
+                age_field = "?" if age is None else str(age)
+                lines.append(
+                    f"BANNED pid={entry.name} rule={matched} cwd={cwd_class} age={age_field}s"
+                )
     per_cpu = None
     if hasattr(os, "getloadavg"):
         try:
