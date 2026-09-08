@@ -281,7 +281,13 @@ def test_the_nofollow_reader_refuses_a_symlink(tmp_path: pathlib.Path) -> None:
     os.symlink(real, link)
 
     assert mod._read_text_nofollow(real) == "secret from elsewhere\n", "a real file still reads"
-    assert mod._read_text_nofollow(link) is None, "a symlink must be refused at the open"
+    # Refused by RAISING, not by returning None. ``None`` is this reader's signal for content
+    # that is not UTF-8 -- an answer about encoding -- and a link is not an encoding problem:
+    # it is a path that changed into something that was never reviewed, which the caller must
+    # not be able to treat as "no text here" and carry on.
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod._read_text_nofollow(link)
+    assert "never reviewed" in str(caught.value)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="needs symlink semantics the fix relies on")
@@ -289,8 +295,8 @@ def test_MUTATION_a_following_reader_would_read_through_the_link(tmp_path: pathl
     """Give the nofollow reader an ordinary following open and the link is read through."""
     mod = load_build(
         mutate=(
-            "fd = os.open(path, os.O_RDONLY | _NOFOLLOW_READ_FLAGS)",
-            "fd = os.open(path, os.O_RDONLY)",
+            "else os.open(str(path), os.O_RDONLY | _NOFOLLOW_READ_FLAGS)",
+            "else os.open(str(path), os.O_RDONLY)",
         )
     )
     real = tmp_path / "real.json"
@@ -610,3 +616,61 @@ def test_an_unchanged_plan_is_still_carried(tmp_path: pathlib.Path) -> None:
 
     _build(mod, home, out, {"skills": {"faq"}})
     assert plan_file.read_text(encoding="utf-8") == body, "the carried plan was not preserved"
+
+
+def test_the_windows_narrowing_is_the_repos_own_settled_answer() -> None:
+    """Windows cannot pin a traversal, and this build does not pretend otherwise.
+
+    A review asked twice for descriptor-anchored traversal on Windows -- "use Windows
+    no-reparse handles for every component". Three facts, each checkable:
+
+    * ``pinned_fs.supports_pinned_walk()`` requires ``O_DIRECTORY``, ``O_NOFOLLOW`` and
+      ``os.open in os.supports_dir_fd``, and returns False on Windows. The repo's own pinning
+      module therefore does not offer this either -- adopting it would not close the gap.
+    * Every caller of it in the tree branches on that predicate rather than assuming it.
+    * ``eval/bench/safepath.py`` reached this exact question and settled it against a ctypes
+      ``CreateFileW`` with ``FILE_FLAG_OPEN_REPARSE_POINT``, because it buys a property
+      another mechanism already gives "at the price of security code that cannot be
+      exercised on the machine this harness is developed on".
+
+    So the Windows branch checks each component by attribute, states that a swap inside the
+    remaining window wins, and refuses a redirect planted before the build ran -- which is
+    the realistic shape. Pinned as a rejection so the next review pass reads the reasoning
+    instead of re-filing the request.
+    """
+    import kiro_crew.pinned_fs as pinned_fs
+
+    src = pathlib.Path(pinned_fs.__file__).read_text(encoding="utf-8")
+    assert "os.open in os.supports_dir_fd" in src, (
+        "supports_pinned_walk stopped gating on dir_fd support; if the repo has gained "
+        "pinned traversal on Windows, this build should use it"
+    )
+    assert "FILE_FLAG_OPEN_REPARSE_POINT" not in src, (
+        "pinned_fs has grown a Windows no-reparse path; the narrowing below is then "
+        "avoidable and should be replaced by it"
+    )
+
+    # Read from THIS tree, and matched on a fragment that does not span the wrap: the
+    # sentence is broken across two source lines, so "worth considering" as one
+    # string is never present in the file.
+    settled = pathlib.Path(pinned_fs.__file__).parent / "eval" / "bench" / "safepath.py"
+    if settled.exists():
+        precedent = settled.read_text(encoding="utf-8")
+        assert (
+            "FILE_FLAG_OPEN_REPARSE_POINT`` is no longer worth" in precedent
+        ), "the precedent this rejection cites is gone; re-argue rather than assume it"
+        assert (
+            "cannot be exercised on the machine" in precedent
+        ), "the precedent's REASON is gone, which is the part this rejection borrows"
+
+
+def test_the_windows_branch_says_what_it_cannot_do() -> None:
+    """The narrowing has to be stated in the source, not just known.
+
+    A limitation a reader cannot find is indistinguishable from an oversight, and this one
+    was filed as a defect twice.
+    """
+    src = (pathlib.Path(__file__).parent.parent / "build.py").read_text(encoding="utf-8")
+    assert (
+        "A swap in the remaining window still wins" in src
+    ), "the Windows branch no longer states its own limit"

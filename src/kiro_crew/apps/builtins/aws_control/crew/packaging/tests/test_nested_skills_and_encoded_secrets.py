@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import pathlib
+
+import pytest
 
 from .test_producer import load_build, make_crew, sign_plan
 
@@ -177,6 +180,86 @@ def _no_dir_fd(mod_loader):
             "    return False",
         )
     )
+
+
+def test_the_read_uses_an_attribute_walk_where_dir_fd_is_unavailable(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An ordinary external prompt must still be READABLE where no descriptor walk exists.
+
+    An earlier version of this test asserted the opposite -- that the read refuses -- and
+    both it and the code under it were wrong. External prompts are a supported feature with
+    their own suite, so refusing on a platform without ``dir_fd`` deleted the feature from
+    Windows instead of hardening it. The Windows CI job said so by reddening six tests,
+    ``test_external_prompt_supported.py`` among them.
+
+    The platform is simulated by mutating the predicate, because the branch cannot be
+    reached on a POSIX host. That is also why the earlier mistake survived every local run:
+    all of them took the strong path.
+    """
+    mod = _no_dir_fd(load_build)
+    root = tmp_path / "agents"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "persona.md").write_bytes(b"content\n")
+
+    fd = mod._open_attr_checked_under(root / "sub" / "persona.md", root)
+    try:
+        assert os.read(fd, 64) == b"content\n"
+    finally:
+        os.close(fd)
+
+
+def test_a_link_above_the_prompt_is_refused_by_the_attribute_walk(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Non-vacuity: the fallback must still refuse what the descriptor walk refuses.
+
+    A parent replaced by a link is the case a single ``O_NOFOLLOW`` open misses, so it is
+    the case that decides whether this fallback is worth having at all. Planted at a PARENT
+    and not at the leaf for exactly that reason.
+    """
+    mod = _no_dir_fd(load_build)
+    secret_dir = tmp_path / "secrets"
+    secret_dir.mkdir()
+    (secret_dir / "persona.md").write_text("private key material\n", encoding="utf-8")
+
+    root = tmp_path / "agents"
+    root.mkdir()
+    (root / "sub").symlink_to(secret_dir, target_is_directory=True)
+
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod._open_attr_checked_under(root / "sub" / "persona.md", root)
+    assert "link or junction" in str(caught.value)
+
+
+def test_a_link_at_the_anchor_is_refused_by_the_attribute_walk(tmp_path: pathlib.Path) -> None:
+    """The anchor is judged by the same rule, which the POSIX walk had to learn separately."""
+    mod = _no_dir_fd(load_build)
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    (real / "sub" / "persona.md").write_bytes(b"content\n")
+    link = tmp_path / "agents"
+    link.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod._open_attr_checked_under(link / "sub" / "persona.md", link)
+    assert "anchor" in str(caught.value)
+
+
+def test_an_external_prompt_inlines_end_to_end_without_dir_fd(tmp_path: pathlib.Path) -> None:
+    """The feature the refusal broke, driven through the real build rather than the opener.
+
+    A unit test of the opener would have stayed green under the refusal too, because the
+    refusal was correct at that level. What it broke was the build, which is what this
+    asserts.
+    """
+    mod = _no_dir_fd(load_build)
+    home = make_crew(tmp_path / "home", prompt="file://persona.md")
+    (home / "agents" / "persona.md").write_bytes(b"an external persona\n")
+    crew = mod.resolve_crew("frontdesk", home)
+    spec = mod.read_agent_spec(crew)
+    result = mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert result.spec["prompt"] == "an external persona\n"
 
 
 def test_skills_still_ship_where_dir_fd_is_unavailable(tmp_path: pathlib.Path) -> None:

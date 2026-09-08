@@ -91,6 +91,24 @@ PLAN_VERSION = 1
 #: from --out, in a directory the build does not own, so replacing an existing file there
 #: needs proof rather than a matching name. Same role ``PLAN_VERSION`` plays for the plan.
 REPORT_VERSION = 1
+
+#: Largest prompt file this build will read into memory, in bytes.
+#:
+#: The prompt is inlined into ``agent.json``, so its bytes are carried in memory, hashed, and
+#: shipped. The path comes from the crew's agent spec, which means the size is chosen by
+#: whoever wrote that spec rather than by this build -- and an unbounded read turns that into
+#: the builder's peak memory.
+#:
+#: 1 MiB because a persona is prose: the largest shipped agent prompt in this repository is
+#: a few kilobytes, so this is three orders of magnitude of headroom and still bounded.
+_MAX_PROMPT_BYTES = 1024 * 1024
+
+#: How far a redirect chain is followed by hand before it is refused.
+#:
+#: Each hop is read with ``readlink``, which traverses nothing, so this bounds the work rather
+#: than the trust. 8 because a legitimate persona reference is a link or two at most, and a
+#: cycle has to terminate somewhere that is not an infinite loop.
+_MAX_REDIRECT_HOPS = 8
 PLAN_FILENAME = "curation-plan.json"
 
 #: Every top-level name ``build_bundle`` writes inside its staging directory. A
@@ -611,30 +629,6 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _read_text_nofollow(path: Path) -> str | None:
-    """Read *path* as UTF-8, refusing a symlink at the OPEN, not before it.
-
-    ``_read_text`` opens through ``pathlib``, which follows a final-component link,
-    so a caller that first checks ``is_file()`` and then reads has a check/read
-    window: a concurrent writer with access to the source tree can loop-swap the
-    file for a symlink between the two and be read through. Opening with
-    ``O_NOFOLLOW`` collapses the check and the read into one syscall -- there is no
-    moment between them to win -- so the link is refused by the kernel at open time
-    rather than by a separate stat that the read then races. Returns ``None`` on a
-    link, a FIFO (``O_NONBLOCK`` keeps the open from hanging), a non-UTF-8 body, or
-    any other open error, exactly like ``_read_text``.
-    """
-    try:
-        fd = os.open(path, os.O_RDONLY | _NOFOLLOW_READ_FLAGS)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "r", encoding="utf-8", newline="") as fh:
-            return fh.read()
-    except (UnicodeDecodeError, OSError):
-        return None
-
-
 def _read_text_openat(root: Path, rel: Path) -> str | None:
     """Read ``root/rel`` as UTF-8, refusing a redirect at EVERY component, not only the last.
 
@@ -674,7 +668,20 @@ def _read_text_openat(root: Path, rel: Path) -> str | None:
             return None
         try:
             with os.fdopen(file_fd, "r", encoding="utf-8", newline="") as fh:
-                return fh.read()
+                # BOUNDED, with the same ceiling the other reader applies. A bare
+                # ``fh.read()`` here asks for -1, so this descriptor-walking path read a
+                # file of any size into memory while its sibling refused one over the
+                # limit -- the ceiling was on the function, not on the read. Reading one
+                # byte past it is what makes "too large" detectable rather than guessed
+                # from a prior stat that the file may not match.
+                data = fh.read(_MAX_PROMPT_BYTES + 1)
+                if len(data) > _MAX_PROMPT_BYTES:
+                    raise ExportRefused(
+                        f"{root / rel} is larger than the {_MAX_PROMPT_BYTES} byte "
+                        f"ceiling for an inlined file, so it is not read. Point the "
+                        f"reference at a smaller file."
+                    )
+                return data
         except (UnicodeDecodeError, OSError):
             return None
     except OSError:
@@ -822,6 +829,65 @@ def _refuse_redirects_in_chain(root: Path, target: str, *, what: str = "prompt f
                 f"is what resolving this path would do, and on Windows a redirect naming a "
                 f"share is an outbound SMB probe before any check runs. Refusing."
             )
+
+
+def _open_attr_checked_under(path: Path, root: Path) -> int:
+    """Open ``path`` where no descriptor walk is available, refusing a redirect first.
+
+    The Windows counterpart of the descriptor walk, and weaker in a way worth stating: an
+    ``lstat`` is not bound to the open the way a descriptor is, so a component replaced
+    between the two is not caught. What it does catch completely is a redirect PLANTED before
+    the build ran, which is the realistic shape -- a junction in a crew directory the
+    operator is about to package. A live swap needs a concurrent writer on the operator's own
+    machine.
+
+    ``_refuse_redirects_in_chain`` has normally already run on the unresolved path, which is
+    where a redirect is still visible. This is the second, narrower check: it re-reads the
+    components of the path actually being opened, so a caller that reaches here by another
+    route is still covered.
+    """
+    try:
+        rel = path.relative_to(root).parts
+    except ValueError:
+        raise ExportRefused(
+            f"prompt file {path} is not under the agents directory {root}. "
+            f"The read is anchored there so a swapped parent cannot be traversed, so a "
+            f"path outside it cannot be read safely and is refused."
+        )
+    if not rel:
+        raise ExportRefused(
+            f"prompt URI names no file: it resolves to the agents directory {root} itself. "
+            f"A prompt reference must name a file to inline."
+        )
+    _refuse_redirects_in_chain(root, str(Path(*rel)))
+    before = os.lstat(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    # What was OPENED is confirmed to be what was CHECKED.
+    #
+    # The walk above judges paths and this open resolves one, so there is a window between
+    # them. This does not close it -- a descriptor walk is what closes it, and that is exactly
+    # what this platform cannot do -- but it turns "the checks were advisory" into "a swap that
+    # happened before the open is detected". A swap in the remaining window still wins, and
+    # saying so is the point: the difference between this and the POSIX path is a real one.
+    #
+    # Identity is (st_dev, st_ino) rather than a path comparison, because a path comparison
+    # would be answering with the same information the walk already used. Windows populates
+    # st_ino with the file index, so this works on the platform that needs it.
+    try:
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise ExportRefused(
+                f"{path} changed between being checked and being opened, so what this build "
+                f"opened is not what it validated. Nothing is read. Retry, and if it recurs "
+                f"something else is writing into the crew directory during the build."
+            )
+    except ExportRefused:
+        os.close(fd)
+        raise
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _refuse_unless_our_report(path: Path, out_dir: Path) -> None:
@@ -1084,6 +1150,221 @@ def _marker_is_ours(path: Path) -> bool:
             return _marker_lines_are_this_run(fh)
     except (IsADirectoryError, UnicodeError):
         return False
+
+
+def _open_root_nofollow(root: Path) -> int:
+    """Open *root* as a directory that is not a symlink, from its own parent.
+
+    The per-component walk in :func:`_open_nofollow_under` is only as good as the
+    descriptor it starts from. Opening *root* directly with a plain ``os.open`` accepts a
+    root that has been replaced by a link, and then every ``O_NOFOLLOW`` check below runs
+    against a descriptor already inside the target: careful verification of the wrong
+    tree.
+
+    So the final component is opened with ``O_NOFOLLOW`` relative to the parent. The
+    parent is still opened normally, which is a real and stated limit: the fence moves one
+    level up rather than becoming infinite. That level is where it buys something, because
+    *root* is the directory an agent can write into (``<source>/agents``), while its parent
+    is the source root the operator named on the command line.
+
+    ``O_NOFOLLOW`` combined with ``O_DIRECTORY`` reports a symlinked final component as
+    ``ENOTDIR`` on Linux rather than ``ELOOP`` -- the kernel's answer is "this is not a
+    directory", which is true of the link itself. ``ELOOP`` is what other platforms give,
+    so both are translated, and ``lstat`` decides which of the two situations to name so
+    the message does not call a plain file a symlink.
+
+    Where ``dir_fd`` is unsupported (Windows) the root is opened with ``O_NOFOLLOW`` alone,
+    which still refuses a link at the root but cannot pin it against a swap between the
+    check and the open. That is the same narrowing :func:`_open_nofollow_under` already
+    declares for the same platform, and it is a branch rather than a crash: the first
+    version reached ``os.O_DIRECTORY`` unconditionally.
+    """
+    if not _dir_fd_supported():
+        return os.open(str(root), os.O_RDONLY | _NOFOLLOW_READ_FLAGS)
+    parent_fd = os.open(str(root.parent), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return os.open(root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno not in {errno.ELOOP, errno.ENOTDIR}:
+            raise
+        try:
+            is_link = stat.S_ISLNK(os.lstat(root.name, dir_fd=parent_fd).st_mode)
+        except OSError:
+            is_link = False
+        if is_link:
+            raise ExportRefused(
+                f"the agents directory {root} is a symlink. Every prompt read is anchored "
+                f"there with the swapped-parent fence, and a link at the anchor itself "
+                f"would make that fence verify the link's target instead. Refusing to "
+                f"read through it."
+            ) from exc
+        raise ExportRefused(
+            f"the agents directory {root} is not a directory. Prompt reads are anchored "
+            f"there, so there is nothing to anchor them to."
+        ) from exc
+    finally:
+        os.close(parent_fd)
+
+
+def _open_nofollow_under(path: Path, root: Path) -> int:
+    """Open ``path`` with every component below ``root`` refusing a symlink.
+
+    ``O_NOFOLLOW`` on a single open only refuses a FINAL-component link. The agents
+    directory is writable, so an agent can leave the leaf name alone and swap a PARENT
+    for a link to ``~/.ssh`` instead: the final component is then a real file, the
+    single-open check passes, and the bundle carries the target's bytes. Reproduced
+    before this existed -- a parent swap read private key material straight into the
+    prompt that ships inside ``agent.json``.
+
+    So each component is opened relative to the previous descriptor with ``O_NOFOLLOW``
+    set, which makes a swapped directory fail at the component that was swapped rather
+    than being traversed.
+
+    ``root`` is opened the same way, from ITS parent, rather than directly. Opening the
+    root normally was the original shape and it left the anchor itself swappable: replace
+    ``<source>/agents`` with a link to ``~/.ssh`` and every per-component check below
+    still passes, because they are all relative to a descriptor that is already inside
+    the attacker's directory. The walk would be verifying the wrong tree carefully.
+
+    Deliberately says nothing about a twin in the container tree. That tree ships in a
+    different change, so on this branch there is no second copy to compare against and no
+    test that could pin one -- and a docstring promising a guarantee its reader cannot
+    check is worse than silence, because it reads as an assurance that something is
+    watching the duplication.
+
+    Falls back to a single ``O_NOFOLLOW`` open where ``dir_fd`` is unsupported
+    (Windows). That is a real narrowing and is spelled as a branch rather than hidden.
+    """
+    if not _dir_fd_supported():
+        # No descriptor walk is available here, so each component is checked BY ATTRIBUTE
+        # instead. A previous version refused outright, and that was wrong: it claimed the
+        # cost was narrow, and the Windows suite showed otherwise -- external prompts are a
+        # supported, separately tested feature (``test_external_prompt_supported.py``), so
+        # refusing removed the feature from the platform rather than hardening it.
+        #
+        # What the attribute walk catches is the whole of the realistic attack. The threat
+        # is a reparse point PLANTED in a crew directory before the build reads it -- a
+        # junction over ``agents`` pointing at a credential directory -- and an lstat of
+        # every component finds that with certainty, junctions included. What it does not
+        # do is bind the check to the read the way a descriptor does, so a component
+        # replaced DURING the walk is not caught; that requires a concurrent writer on the
+        # operator's own machine, which is a strictly harder position than planting a
+        # junction in a directory the operator is about to package. The asymmetry is stated
+        # rather than papered over: this is weaker than the POSIX path, and it is the
+        # strongest check the platform offers.
+        return _open_attr_checked_under(path, root)
+
+    try:
+        rel = path.relative_to(root).parts
+    except ValueError:
+        # Not under the root the caller vouched for. _resolve_prompt_path is supposed to
+        # have guaranteed this, so reaching here means a fence moved: refuse instead of
+        # silently reading a path nothing anchored.
+        raise ExportRefused(
+            f"prompt file {path} is not under the agents directory {root}. "
+            f"The read is anchored there so a swapped parent cannot be traversed, so a "
+            f"path outside it cannot be read safely and is refused."
+        )
+
+    if not rel:
+        # The path IS the root. Reached by ``"prompt": "file://"`` with an empty target:
+        # ``Path("") -> "."``, so ``(agents_dir / "").resolve()`` is the agents directory
+        # itself, every fence passes because a source's agents directory is not sensitive,
+        # and this function then computed ``rel = ()`` and raised ``IndexError`` on
+        # ``rel[-1]``. That is neither ``OSError`` nor ``ExportRefused``, so it escaped
+        # ``main``'s handler and printed a traceback where the module's whole contract is to
+        # refuse cleanly. Refusing here also covers ``file://.`` and any other spelling that
+        # resolves to the root.
+        raise ExportRefused(
+            f"prompt URI names no file: it resolves to the agents directory {root} itself. "
+            f"A prompt reference must name a file to inline."
+        )
+    dir_fd = _open_root_nofollow(root)
+    try:
+        for part in rel[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+        return os.open(rel[-1], os.O_RDONLY | _NOFOLLOW_READ_FLAGS, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_text_nofollow(
+    path: Path, root: Path | None = None, *, what: str = "prompt file"
+) -> str | None:
+    """Read text through a descriptor, refusing a final-component symlink at open.
+
+    The prompt fences in ``_resolve_prompt_path`` all run against a PATH and then
+    hand that path on to be re-opened. The agents directory is writable, so the entry
+    can become a link to a credential file between the last check and the read, and
+    every fence would have passed. Opening once and reading from that same descriptor
+    is what makes the checks binding rather than advisory.
+
+    Returns ``None`` for content that is not UTF-8 (the caller's existing signal), and
+    raises ``ExportRefused`` for the two cases that are not about encoding: the file
+    is gone, or what is there is not a plain file.
+    """
+    try:
+        fd = (
+            _open_nofollow_under(path, root)
+            if root is not None
+            else os.open(str(path), os.O_RDONLY | _NOFOLLOW_READ_FLAGS)
+        )
+    except FileNotFoundError:
+        raise ExportRefused(
+            f"{what} {path} does not exist, so the crew's persona cannot be "
+            f"bundled. Exporting as-is would deploy a crew that answers as nobody."
+        ) from None
+    except OSError as exc:
+        # ELOOP is the interesting one: the path passed every fence as a regular file
+        # and is a symlink by the time it is opened.
+        raise ExportRefused(
+            f"{what} {path} could not be opened as a plain file ({exc}). It "
+            f"passed the prompt fences and then changed, so what it points at now was "
+            f"never reviewed."
+        ) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ExportRefused(
+                f"prompt file {path} is not a regular file, so it is not a persona."
+            )
+        # Only when O_NONBLOCK was actually applied. On Windows neither that flag
+        # nor set_blocking() works on a regular-file descriptor -- it raises
+        # WinError 87 -- and there is nothing to undo there anyway. Located by
+        # reading the traceback: the previous attempt at this guessed os.read was
+        # to blame and changed the wrong line.
+        if getattr(os, "O_NONBLOCK", 0) and _NOFOLLOW_READ_FLAGS & os.O_NONBLOCK:
+            os.set_blocking(fd, True)
+        # Read through a file object rather than a raw os.read loop. A 1 MiB os.read
+        # on Windows raises WinError 87 (invalid parameter), which reddened this on
+        # the Windows shard; fdopen sizes its own buffers per platform. The
+        # descriptor has already passed O_NOFOLLOW and the regular-file check, and
+        # wrapping it changes neither -- closefd=False keeps the close in the
+        # caller's finally, so there is exactly one close.
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            # Bounded at the READ, not by a prior stat. The prompt path is operator-supplied
+            # and the file behind it is whatever it points at, so an unbounded read makes the
+            # builder's peak memory a property of a path in a crew directory. Asking for one
+            # byte past the ceiling is what makes "too large" observable without holding a
+            # second copy: if that byte arrives, the file is over and nothing more is read.
+            #
+            # A stat-then-read pair would leave the bound advisory -- the agents directory is
+            # writable, so a file that measured small can be extended before the read, and it
+            # is the read that allocates.
+            data = fh.read(_MAX_PROMPT_BYTES + 1)
+        if len(data) > _MAX_PROMPT_BYTES:
+            raise ExportRefused(
+                f"the prompt file {path} is larger than {_MAX_PROMPT_BYTES} bytes. A persona "
+                f"is prose and this one is not, so it is refused rather than read into memory "
+                f"and inlined into agent.json. Point the prompt at the persona."
+            )
+    finally:
+        os.close(fd)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def skill_candidates(skills_root: Path) -> list[Candidate]:
@@ -1382,7 +1663,7 @@ def read_agent_spec(crew: ResolvedCrew) -> dict:
     # as ``agent.json`` inside the bundle, so this read reaches the customer just as directly
     # as an inlined prompt does. ``--source`` is the operator's flag and the crew name is
     # validated, so the shape ``<source>/agents/<name>.json`` is narrow -- but "narrow" was
-    # the argument for the local denylist that three review rounds each holed, so the answer
+    # the argument for the local denylist that three review passes each holed, so the answer
     # is to ask the shared question rather than to argue about reach.
     #
     # Unlike the prompt path this does NOT refuse outright when the fence is unimportable:
@@ -1436,6 +1717,20 @@ def read_agent_spec(crew: ResolvedCrew) -> dict:
     # case distinguishable from an unreadable one via a non-following stat.
     anchor = path.parent.parent
     text = _read_text_openat(anchor, path.relative_to(anchor))
+    # concurrent writer could win by loop-swapping the spec for a symlink between the two.
+    # ``_read_text_nofollow`` collapses check and read into one ``O_NOFOLLOW`` open, so a
+    # link is refused by the kernel at open time with no moment in between to race. A missing
+    # file, a link, a FIFO or a directory all surface here as ``None``; the two errors below
+    # keep the "nothing to deploy" case (no spec at all) distinguishable from an unreadable
+    # one, resolved by whether the path exists as a non-following stat AFTER the safe open
+    # has already refused a link.
+    # ``what`` names the AGENT SPEC here. The reader's two consumers are this one and the
+    # prompt path, and its refusals reach the operator verbatim -- so a missing spec that
+    # said "prompt file does not exist" sent them looking for a persona they never
+    # referenced. Found by a review reading the second consumer of a shared function,
+    # which is the check a change to a shared reader needs and a direct unit test does not
+    # give.
+    text = _read_text_nofollow(path, what="agent spec")
     if text is None:
         try:
             present = os.lstat(path)
@@ -1511,7 +1806,7 @@ class Drift:
         if self.appeared:
             parts.append(f"{self.appeared} new candidate(s) appeared (all excluded)")
         if self.vanished:
-            parts.append(f"{self.vanished} candidate(s) no longer exist")
+            parts.append(f"{self.vanished} candidate(s) no longer present")
         return "; ".join(parts)
 
 
@@ -1650,7 +1945,7 @@ def verify(plan: Plan, crew: str, candidates: dict[str, list[Candidate]]) -> Dri
         for cid in plan.included(kind):
             candidate = by_kind[kind].get(cid)
             if candidate is None:
-                raise ExportRefused(f"plan selects {kind}/{cid!r}, which no longer exists")
+                raise ExportRefused(f"plan selects {kind}/{cid!r}, which does not exist")
             if candidate.blocked:
                 raise ExportRefused(
                     f"plan selects {kind}/{cid!r}, which cannot be included: {candidate.blocked}"
@@ -1738,27 +2033,234 @@ def merge_plans(paths: list[Path], crew: str) -> Plan | None:
 # Ported from ``crew_export/spec.py`` and the reader guards in
 # ``serving/smc/bundle.py`` (validate_prompt, validate_tool_refs).
 # ===========================================================================
+def _resolve_prompt_path(raw: str, agents_dir: Path) -> Path:
+    target = raw[len("file://") :]
+    # BEFORE `Path(target)` and before any resolution, because on Windows resolving a
+    # UNC path IS the outbound SMB probe -- `hooks.validate_file_path` says exactly that
+    # in its own docstring: "the Windows UNC trusted-root gate (BEFORE any resolution --
+    # realpath on a UNC path is itself the outbound SMB probe)". An agent spec carrying
+    # `file:////attacker/share/persona.md` therefore reached the attacker's host through
+    # `path.resolve()` below, ahead of every fence in this function, and a Windows SMB
+    # touch hands over an NTLM exchange.
+    #
+    # The gate is IMPORTED rather than restated. This repo already owns the rule, and a
+    # second spelling of it is the mistake this branch has now paid for seven times. The
+    # trusted-root allowance comes along with it, so a persona that legitimately lives on
+    # a share the operator configured still resolves.
+    #
+    # nt-scoped to match hooks: on POSIX a leading `//` names no network location, and
+    # refusing it here would reject a legitimate absolute path written with a doubled
+    # slash while protecting nothing.
+    if os.name == "nt":
+        # Fail CLOSED when the import is unavailable, which is the standalone venv on
+        # Windows. The opposite of the agent-spec fence, and for the opposite reason: there
+        # the read is the tool's whole purpose and a coarse local list can answer the
+        # question, while here the question is whether resolving this path reaches a host
+        # over SMB -- and an unanswerable version of that question is not a reason to
+        # resolve it anyway. Refusing costs the operator one copy of the persona; a bare
+        # ModuleNotFoundError costs them an uncaught crash mid-build.
+        try:
+            from kiro_crew.hooks import is_unc_shape, unc_probe_allowed
+        except ImportError as exc:
+            raise ExportRefused(
+                f"cannot judge whether the prompt URI {raw!r} names a UNC path, because "
+                f"kiro_crew.hooks is not importable here ({exc}). Resolving it could reach "
+                f"a host over SMB before any check runs, so it is refused rather than "
+                f"resolved unchecked. Copy the persona next to the agent spec and reference "
+                f"it by name, or run this build where kiro_crew is installed."
+            ) from exc
+
+        if is_unc_shape(target) and not unc_probe_allowed(target):
+            raise ExportRefused(
+                f"prompt URI {raw!r} is a UNC path outside the trusted roots. Resolving "
+                f"it would reach that host over SMB before this build could check "
+                f"anything about it, and a Windows SMB touch carries an NTLM exchange. "
+                f"Copy the persona next to the agent spec and reference it by name."
+            )
+    path = Path(target)
+    if not path.is_absolute():
+        # The UNRESOLVED chain is checked BEFORE ``resolve()``, because resolve is itself the
+        # traversal. Two things were wrong with checking afterwards.
+        #
+        # First, resolve() on Windows follows a reparse point, and following one that points
+        # at a share IS the outbound SMB probe with its NTLM exchange. The UNC gate above
+        # only sees a UNC path written literally in the target string, so a junction reaching
+        # the same host was not covered by it and the probe happened before any fence ran.
+        #
+        # Second, resolve() COLLAPSES the links, so a check placed after it inspects the
+        # targets and cannot see that a link was ever there. An implementation of
+        # this branch walked the components of the resolved path looking for reparse points
+        # and could never have found one; it passed its own tests only because those called
+        # it directly with an unresolved path, which is not what this call site hands it.
+        _refuse_redirects_in_chain(agents_dir, target)
+        path = (agents_dir / target).resolve()
+        try:
+            path.relative_to(agents_dir.resolve())
+        except ValueError:
+            raise ExportRefused(f"prompt URI {raw!r} escapes the agents directory") from None
+    elif os.name == "nt":
+        # On the absolute branch the fence is NOT a ban on links.
+        #
+        # A symlink at the prompt path is a SUPPORTED case: the design permits a persona
+        # outside the agents directory and protects it by checking the RESOLVED target against
+        # this repository's sensitive-path fence, which
+        # ``test_a_symlink_to_a_legitimate_persona_still_works`` pins. Walking the absolute
+        # path and refusing every redirect was tried and it reddened that test plus four more
+        # -- it protected the supported case out of existence.
+        #
+        # What the relative branch's walk buys that the target check cannot is narrower than it
+        # looks: on Windows, ``resolve()`` following a reparse point that names a SHARE is
+        # itself the outbound SMB probe, carrying an NTLM exchange before any fence has read
+        # anything. The UNC gate above only sees a share written literally in the target
+        # string, so a reparse point reaching one is the gap -- and it is the only gap, because
+        # everything else a redirect can do is caught by the target check after resolution.
+        #
+        # So the components are read with ``readlink``, which does NOT traverse, and only a
+        # redirect whose target has UNC shape is refused. nt-scoped because there is no such
+        # probe elsewhere: on POSIX a leading ``//`` names no network location, which is the
+        # same reason the UNC gate above is nt-scoped.
+        # Imported bare, and that is deliberate. The nt branch at the top of this function
+        # imports the same module unconditionally and refuses when it is unavailable, so any
+        # call that reaches HERE has already proven the import succeeds. A second try/except
+        # would be a guard no input can trigger: an ImportError case that cannot happen reads
+        # as protection while testing nothing, and one was written here and removed after a
+        # mutation showed every test still passed with it gone.
+        from kiro_crew.hooks import is_unc_shape as _unc
+
+        probe = Path(path.anchor)
+        for part in path.relative_to(path.anchor).parts:
+            probe = probe / part
+            if not _is_redirecting_entry(probe):
+                continue
+            # The whole CHAIN, not just the first hop. Checking only the immediate target
+            # left link -> link -> share open: the first readlink returns a local path, the
+            # UNC test says no, and ``resolve()`` then follows the rest of the chain to the
+            # share anyway. One hop is not a fence when hops compose.
+            #
+            # ``readlink`` is used rather than ``resolve()`` on purpose: it reads the link's
+            # own contents and traverses nothing, so walking the chain by hand never performs
+            # the probe this exists to prevent. Bounded at _MAX_REDIRECT_HOPS because a link
+            # cycle would otherwise spin here; a chain that long is refused rather than
+            # followed further, since anything needing that many hops is not a persona path.
+            hop = probe
+            for _ in range(_MAX_REDIRECT_HOPS):
+                try:
+                    dest = os.readlink(hop)
+                except OSError:
+                    break
+                if _unc(str(dest)):
+                    raise ExportRefused(
+                        f"{probe} on the path to the prompt file redirects to {dest!r}, which "
+                        f"names a network share. Resolving this path would reach that host "
+                        f"over SMB before anything could be checked, and a Windows SMB touch "
+                        f"carries an NTLM exchange. Copy the persona next to the agent spec."
+                    )
+                nxt = Path(dest)
+                hop = nxt if nxt.is_absolute() else hop.parent / nxt
+                if not _is_redirecting_entry(hop):
+                    break
+            else:
+                raise ExportRefused(
+                    f"{probe} on the path to the prompt file starts a chain of more than "
+                    f"{_MAX_REDIRECT_HOPS} redirects. Where it ends cannot be established "
+                    f"without following it, which is the thing this check exists to avoid. "
+                    f"Copy the persona next to the agent spec."
+                )
+    # ONE resolution, and every check below runs on its result. An earlier version
+    # resolved the target for the credential fences but left this pseudo-filesystem
+    # loop testing the path as written, so a symlink to /proc/self/environ passed
+    # all three: the link is not under /proc, and /proc is not a credential
+    # location. The read then followed the link and inlined the deploy process's
+    # environment into the shipped prompt, where scan_text catches only
+    # credential-SHAPED text and a secret in another format survives.
+    #
+    # Containment under agents_dir is deliberately NOT required: an absolute
+    # persona path outside that directory is a supported case with its own test.
+    #
+    # ``resolved`` is a DISTINCT name rather than a reassignment of ``target``.
+    # The two are different things -- the URI as written versus what it points at
+    # -- and collapsing them into one name is how the symlink bug above was
+    # written in the first place: every check read ``target`` and it was not
+    # obvious which of the two any given line meant. mypy rejects the reassignment
+    # outright (``target`` is the ``str`` sliced off ``raw``), which is the type
+    # checker naming the same problem.
+    # Called bare, and that is deliberate. ``resolve()`` raises ``OSError(ELOOP)`` on a
+    # symlink cycle, but no input reaches this line with a cycle in it:
+    # ``_refuse_redirects_in_chain`` above judges every component with ``lstat`` and refuses
+    # the FIRST redirect it finds, so a -> b -> a is rejected at ``a``. A try/except here
+    # would be an error path no test can enter -- one was written and removed after the
+    # cycle test it came with proved the refusal comes from the chain walk instead, with a
+    # message that names the link rather than the failed resolution.
+    resolved = path.resolve()
+    posix = resolved.as_posix()
+    for root in ("/proc", "/sys", "/dev"):
+        if posix == root or posix.startswith(root + "/"):
+            raise ExportRefused(
+                f"prompt URI {raw!r} resolves to {resolved}, inside a "
+                f"pseudo-filesystem. Those files are process and kernel state, not "
+                f"a persona, and one of them is this deploy process's own "
+                f"environment."
+            )
+    # The repo's own fence, when this module can reach it. The local predicates
+    # below are a deliberate self-contained subset, and three review passes in a
+    # row found one more thing that subset does not name (a kubeconfig, then a
+    # symlink, then a git credential store). A denylist needing a new entry per
+    # review pass is the wrong shape here, so prefer the shared implementation
+    # and keep the local pair as the fallback that preserves this module's ability
+    # to run without kiro_crew importable.
+    try:
+        from kiro_crew.security import is_sensitive_path
+
+        _shared_fence: Callable[[str], bool] | None = is_sensitive_path
+    except Exception:
+        _shared_fence = None
+    # FAIL CLOSED when the shared fence is unreachable, rather than continuing on the local
+    # subset. The fallback was written to preserve this module's ability to run without
+    # ``kiro_crew`` importable, and that intent is fine -- but the thing it falls back to is
+    # a denylist that three consecutive review passes each found one more hole in (a
+    # kubeconfig, a symlink, a git credential store). Continuing on it means an environment
+    # where the import fails is an environment where ``file://~/.git-credentials`` is read
+    # and bundled, and nothing in the output says the weaker check was the one that ran.
+    #
+    # An EXTERNAL prompt reference is the only thing this gates, so the refusal costs a
+    # feature that reaches outside the crew directory, not the ordinary case. A crew whose
+    # prompt is inline, or a file beside the spec, is unaffected.
+    if _shared_fence is None:
+        raise ExportRefused(
+            f"cannot check whether prompt URI {raw!r} points at sensitive material: this "
+            f"repository's own path fence (kiro_crew.security.is_sensitive_path) is not "
+            f"importable here. The local checks below are a deliberate subset and have "
+            f"been found short three times, so an external prompt reference is refused "
+            f"rather than judged by them. Inline the prompt, or run where kiro_crew "
+            f"is importable."
+        )
+    if _shared_fence(posix):
+        raise ExportRefused(
+            f"prompt URI {raw!r} resolves to {resolved}, which this repository "
+            f"treats as a sensitive path. A prompt may reference an agent persona, "
+            f"not credential or key material."
+        )
+    if refused_by_name(resolved) or refused_by_name(path):
+        raise ExportRefused(f"prompt URI {raw!r} points at a credential location")
+    if refused_by_location(resolved) or refused_by_location(path):
+        raise ExportRefused(
+            f"prompt URI {raw!r} resolves to {resolved}, inside a credential "
+            f"directory; the file is not read. Its contents cannot be trusted to "
+            f"be scannable (a kubeconfig's certificate is base64 and may match no "
+            f"credential pattern), so it is refused before any read rather than "
+            f"read and then scanned."
+        )
+    return path
 
 
 def _inline_prompt(spec: dict, crew_name: str, agents_dir: Path, notes: list[str]) -> None:
-    """Require the prompt to be literal text; refuse a missing one or a file reference.
+    """Inline a ``file://`` prompt as literal text; refuse a missing persona.
 
-    Kiro Crew writes an installed agent's prompt as ``file://<absolute host path>``
-    (``kiro_crew/agent.py:2166``). That path does not exist in the container, so a naively
-    copied spec produces a crew that answers as nobody -- and kiro-cli tolerates an empty
-    prompt, so the failure is silent. Refused here
-    (``serving/smc/bundle.py:validate_prompt`` refuses it at startup too).
-
-    READING the referenced file is deliberately NOT part of this change. Doing it safely means
-    resolving an operator-supplied path without following a redirect, on two platforms with
-    different link semantics, before any resolution can reach the network -- roughly 350 lines
-    whose review found 20+ separate defects across seven rounds while the rest of this module
-    was settled. It ships as its own change, where a reviewer can hold all of it at once.
-
-    So a ``file://`` prompt is refused with an instruction the operator can act on today:
-    inline the persona. That is a real limitation and it is stated rather than worked around --
-    some shipped agents (``apps/builtins/pptx_maker/agents/*.json``) use the file form, and
-    those crews cannot be bundled until the follow-up lands.
+    Kiro Crew writes an installed agent's prompt as ``file://<absolute host
+    path>`` (``kiro_crew/agent.py:2166``). That path does not exist in the
+    container, so a naively copied spec produces a crew that answers as nobody --
+    and kiro-cli tolerates an empty prompt, so the failure is silent. Refused
+    here (``serving/smc/bundle.py:validate_prompt`` refuses it at startup too).
     """
     raw = spec.get("prompt")
     if raw is None or not isinstance(raw, str) or not raw.strip():
@@ -1767,16 +2269,56 @@ def _inline_prompt(spec: dict, crew_name: str, agents_dir: Path, notes: list[str
             f"persona and kiro-cli tolerates an empty one, so a crew shipped this way "
             f"answers as nobody. Inline the persona as literal text."
         )
-    if raw.strip().lower().startswith("file://"):
-        raise ExportRefused(
-            f"agent.json for {crew_name!r} references its prompt as a file "
-            f"({raw.strip()[:80]!r}). Reading it safely needs the path fences that are "
-            f"landing separately, so this build does not follow the reference. Copy the "
-            f'persona into the spec\'s "prompt" field as literal text.'
-        )
-    leaks = scan_text(raw, "prompt")
+    if not raw.strip().lower().startswith("file://"):
+        leaks = scan_text(raw, "prompt")
+        if leaks:
+            raise ExportRefused("the crew's prompt contains a credential: " + leaks[0].render())
+        return
+    path = _resolve_prompt_path(raw.strip(), agents_dir)
+    # Anchor the descendant-wise read at the root this path was actually validated
+    # under, which is NOT always agents_dir. `_resolve_prompt_path` documents that
+    # "containment under agents_dir is deliberately NOT required: an absolute persona
+    # path outside that directory is a supported case with its own test." Passing
+    # agents_dir unconditionally therefore refused that supported case outright --
+    # reproduced: an absolute persona under a sibling directory aborted the whole
+    # bundle with "is not under the agents directory".
+    #
+    # The two anchors buy different things, and the difference is the point:
+    #
+    #   * A prompt INSIDE agents_dir gets per-component O_NOFOLLOW from agents_dir down.
+    #     That directory is writable by the agent, so a swapped PARENT is a live attack
+    #     and every component below the anchor has to be checked.
+    #   * An absolute prompt OUTSIDE it gets the final-component check only, by anchoring
+    #     at its own parent. Walking from `/` with O_NOFOLLOW would refuse any legitimate
+    #     path whose ancestors include a symlink, which is most real installs -- so
+    #     claiming that protection would cost the supported case and deliver nothing.
+    #     This is the protection the code had before the parent-swap fix, unchanged.
+    try:
+        path.relative_to(agents_dir)
+        anchor = agents_dir
+    except ValueError:
+        anchor = path.parent
+    # Read through a descriptor opened WITHOUT following a link at ANY component, and
+    # do not re-open. _resolve_prompt_path applies every fence -- pseudo-filesystem,
+    # the repo's sensitive-path predicate, the credential name and location checks --
+    # and then returns a PATH. Re-opening that path here made the fences advisory: the
+    # agents directory is writable, so between the last check and this read the entry
+    # can become a link to ~/.aws/credentials, and the bundle would carry the target's
+    # bytes with every fence having passed. Same defect the sidecar's backup read had,
+    # in the opposite direction (that one exfiltrates by upload, this one by shipping
+    # the bytes inside the artifact).
+    #
+    # agents_dir is the anchor: a single O_NOFOLLOW only refuses a FINAL-component
+    # link, so without it an agent leaves the leaf alone and swaps a PARENT instead.
+    # Measured -- that read private key material into the prompt.
+    text = _read_text_nofollow(path, anchor)
+    if text is None or not text.strip():
+        raise ExportRefused(f"prompt file {path} is empty or not UTF-8 text")
+    leaks = scan_text(text, f"prompt({path.name})")
     if leaks:
         raise ExportRefused("the crew's prompt contains a credential: " + leaks[0].render())
+    spec["prompt"] = text
+    notes.append(f"inlined prompt from {path} ({len(text)} chars)")
 
 
 def _clean_mcp_server(name: str, server: dict, notes: list[str]) -> dict:
@@ -1864,7 +2406,7 @@ def build_spec(
         server = source_servers.get(name)
         if not isinstance(server, dict):
             raise ExportRefused(
-                f"plan selects MCP server {name!r}, which the spec no longer declares"
+                f"plan selects MCP server {name!r}, which the spec does not declare"
             )
         mcp[name] = _clean_mcp_server(name, server, notes)
     dropped = sorted(set(source_servers) - set(mcp))

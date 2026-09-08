@@ -161,6 +161,104 @@ def mod_resolve(root: pathlib.Path, name: str):
 # ---------------------------------------------------------------------------
 # F3: the anchor root itself must not be a link
 # ---------------------------------------------------------------------------
+@pytest.mark.skipif(os.name != "posix", reason="needs symlink semantics the fix relies on")
+def test_the_root_opener_refuses_a_symlinked_root(tmp_path: pathlib.Path) -> None:
+    """A root that IS a link is refused, which is the state the swap produces.
+
+    Tested on the opener directly, not through a build, because of where resolution sits:
+    ``_resolve_prompt_path`` calls ``resolve()`` and derives the anchor from the RESULT, so
+    a link present when the spec is read is followed by design and the opener never sees
+    it. What the opener defends is the window AFTER that -- root validated, then replaced,
+    then opened -- and a link at the anchor is exactly the state that window leaves behind.
+
+    Reaching for a real race here would test the scheduler. Asserting on the state the race
+    produces tests the fix.
+    """
+    mod = load_build()
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    (real / "sub" / "persona.md").write_bytes(b"content\n")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod._open_root_nofollow(link)
+    assert "symlink" in str(caught.value).lower(), str(caught.value)
+
+    with pytest.raises(mod.ExportRefused):
+        mod._open_nofollow_under(link / "sub" / "persona.md", link)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs symlink semantics the fix relies on")
+def test_MUTATION_a_plain_root_open_traverses_the_swapped_anchor(tmp_path: pathlib.Path) -> None:
+    """Restore the plain open and the swapped anchor is traversed instead of refused.
+
+    This is what "the fence verifies the wrong tree carefully" means in practice: every
+    per-component ``O_NOFOLLOW`` below still passes, because they are all relative to a
+    descriptor already inside the link's target.
+    """
+    mod = load_build(
+        mutate=(
+            "    dir_fd = _open_root_nofollow(root)",
+            "    dir_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY)",
+        )
+    )
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    (real / "sub" / "persona.md").write_bytes(b"content\n")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    fd = mod._open_nofollow_under(link / "sub" / "persona.md", link)
+    os.close(fd)  # it opened, which is the defect
+
+
+def test_a_real_root_is_opened_normally(tmp_path: pathlib.Path) -> None:
+    """Non-vacuity: refusing every root would satisfy the tests above and break the read."""
+    mod = load_build()
+    real = tmp_path / "agents"
+    (real / "sub").mkdir(parents=True)
+    (real / "sub" / "persona.md").write_bytes(b"content\n")
+    fd = mod._open_nofollow_under(real / "sub" / "persona.md", real)
+    try:
+        assert os.read(fd, 32) == b"content\n"
+    finally:
+        os.close(fd)
+
+
+def test_a_prompt_inside_a_real_agents_directory_still_inlines(tmp_path: pathlib.Path) -> None:
+    """The end-to-end path the root check sits on must still work."""
+    mod = load_build()
+    src = make_crew(tmp_path / "home", prompt="file://persona.md")
+    (src / "agents" / "persona.md").write_text("the real persona\n", encoding="utf-8")
+    crew = mod.resolve_crew("frontdesk", src)
+    spec = mod.read_agent_spec(crew)
+    result = mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert "the real persona" in result.spec["prompt"]
+
+
+def test_the_root_opener_is_used_by_the_anchored_walk() -> None:
+    """A source assertion: the walk must not go back to a plain open of the root.
+
+    Behaviourally the two spellings differ only under a swap, which needs a symlink and so
+    cannot be exercised on every platform. This holds the mechanism everywhere.
+    """
+    import ast
+
+    from .test_producer import BUILD_PY
+
+    tree = ast.parse(BUILD_PY.read_text(encoding="utf-8"), str(BUILD_PY))
+    walker = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_open_nofollow_under"
+    )
+    calls = [
+        n
+        for n in ast.walk(walker)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_open_root_nofollow"
+    ]
+    assert calls, "the anchored walk no longer opens its root through the no-follow helper"
 
 
 # ---------------------------------------------------------------------------

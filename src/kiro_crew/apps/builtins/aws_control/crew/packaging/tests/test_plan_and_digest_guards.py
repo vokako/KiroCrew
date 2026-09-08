@@ -57,6 +57,70 @@ def _build(mod, home: pathlib.Path, work: pathlib.Path, select):
 # ---------------------------------------------------------------------------
 # R1
 # ---------------------------------------------------------------------------
+def test_a_linked_parent_is_refused_through_the_real_build(tmp_path: pathlib.Path) -> None:
+    """Driven end to end, because the previous version passed a UNIT test and did nothing.
+
+    The refusal must name the LINK, which is what distinguishes the chain check from the
+    containment check that had been carrying this case. Containment compares resolved paths,
+    so it would refuse with 'escapes the agents directory' while the walk saw nothing.
+    """
+    mod = load_build()
+    secret = tmp_path / "secrets"
+    secret.mkdir()
+    (secret / "persona.md").write_bytes(b"PRIVATE KEY MATERIAL\n")
+    home = make_crew(tmp_path / "home", prompt="file://sub/persona.md")
+    (home / "agents" / "sub").symlink_to(secret, target_is_directory=True)
+
+    crew = mod.resolve_crew("frontdesk", home)
+    spec = mod.read_agent_spec(crew)
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert "link or junction" in str(caught.value), str(caught.value)
+
+
+def test_the_check_runs_before_any_resolution(tmp_path: pathlib.Path) -> None:
+    """The ordering IS the fix, so it is asserted rather than assumed.
+
+    A link whose target does not exist cannot be resolved at all in strict terms, and cannot
+    be probed. If the refusal still names the link, the check ran on the path as written --
+    which is the only place a redirect is visible.
+    """
+    mod = load_build()
+    home = make_crew(tmp_path / "home", prompt="file://sub/persona.md")
+    (home / "agents" / "sub").symlink_to(tmp_path / "nowhere", target_is_directory=True)
+
+    crew = mod.resolve_crew("frontdesk", home)
+    spec = mod.read_agent_spec(crew)
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert "link or junction" in str(caught.value), str(caught.value)
+
+
+def test_a_parent_reference_is_refused_rather_than_normalised(tmp_path: pathlib.Path) -> None:
+    """``a/../b`` is not ``b`` when ``a`` is a link, so it is not normalised here."""
+    mod = load_build()
+    home = make_crew(tmp_path / "home", prompt="file://sub/../persona.md")
+    (home / "agents" / "sub").mkdir()
+    (home / "agents" / "persona.md").write_bytes(b"content\n")
+
+    crew = mod.resolve_crew("frontdesk", home)
+    spec = mod.read_agent_spec(crew)
+    with pytest.raises(mod.ExportRefused) as caught:
+        mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert "parent directory" in str(caught.value)
+
+
+def test_an_ordinary_nested_prompt_still_inlines(tmp_path: pathlib.Path) -> None:
+    """Non-vacuity: the chain check must not refuse a plain subdirectory."""
+    mod = load_build()
+    home = make_crew(tmp_path / "home", prompt="file://sub/persona.md")
+    (home / "agents" / "sub").mkdir()
+    (home / "agents" / "sub" / "persona.md").write_bytes(b"a nested persona\n")
+
+    crew = mod.resolve_crew("frontdesk", home)
+    spec = mod.read_agent_spec(crew)
+    result = mod.build_spec(crew, spec, set(), crew.agent_spec_path.parent)
+    assert result.spec["prompt"] == "a nested persona\n"
 
 
 # ---------------------------------------------------------------------------
