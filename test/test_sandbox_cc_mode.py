@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import runpy
+import stat
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -132,8 +134,87 @@ class TestBuildLauncherScriptCcMode:
         script = _build_launcher_script("standard")
         assert "EXPOSE_FILES = []" in script
 
+    def test_extra_expose_files_are_embedded_with_their_basename(self):
+        """The enforced-adapter mask's Linux half rides the cc expose primitive.
+
+        ``acp_tool_gate.adapter_expose_files`` hands absolute paths here; each
+        must land in EXPOSE_FILES as a ``(source, basename)`` pair so the
+        launcher restores a read-only copy inside the hidden parent. Standard
+        tier, because that is the tier the codex adapter actually runs under.
+        """
+        script = _build_launcher_script("standard", extra_expose_files=("/h/u/.aws/config",))
+        assert '["/h/u/.aws/config", "config"]' in script
+
+    def test_cc_expose_files_survive_extra_entries(self):
+        script = _build_launcher_script("cc", extra_expose_files=("/h/u/.aws/config",))
+        assert ".aws/config" in script
+        assert '["/h/u/.aws/config", "config"]' in script
+
+    def test_an_extra_expose_file_already_in_the_tier_list_appears_once(self):
+        """cc + codex both name ``~/.aws/config``; EXPOSE_FILES must carry it once.
+
+        The restore loop writes each entry's destination then chmods it 0444, so
+        a duplicate entry's second open-for-write raises PermissionError inside
+        the launcher and the spawn dies. Revert-verified: without the dedupe the
+        pair appears twice.
+        """
+        cfg = os.path.join(str(Path.home()), ".aws", "config")
+        script = _build_launcher_script("cc", extra_expose_files=(cfg,))
+        pair = json.dumps([cfg, "config"])
+        assert script.count(pair) == 1, script.count(pair)
+
 
 class TestBuildSeatbeltProfileCcMode:
+    def test_extra_expose_file_carves_read_only_out_of_an_extra_hidden_dir(self):
+        """The enforced adapter's ``~/.aws/config`` on macOS.
+
+        Read deny becomes ``require-all (subpath) (require-not (literal))`` --
+        the same shape the strict tier uses for ``.ssh/known_hosts`` -- while the
+        write and hardlink denies stay blanket over the subpath, so the child
+        can read its ``credential_process`` entry and nothing else, and cannot
+        rewrite or hardlink the file it is allowed to read.
+        """
+        profile = _build_seatbelt_profile(
+            "standard",
+            extra_hidden_dirs=("/h/u/.aws",),
+            extra_expose_files=("/h/u/.aws/config",),
+        )
+        assert (
+            '(deny file-read* (require-all (subpath "/h/u/.aws")'
+            ' (require-not (literal "/h/u/.aws/config"))))'
+        ) in profile
+        assert '(deny file-read* (subpath "/h/u/.aws"))' not in profile
+        assert '(deny file-write* (subpath "/h/u/.aws"))' in profile
+        assert '(deny file-link (subpath "/h/u/.aws"))' in profile
+
+    def test_extra_expose_file_is_carved_when_the_tier_already_hides_the_dir(self):
+        """strict already lists ``.aws``; the tier loop must carry the carve-out too.
+
+        Seatbelt cannot cancel an earlier blanket deny with a later narrower one,
+        so if only the extra-hidden loop carved the file out, a strict-tier codex
+        would still fail auth. Both loops must emit the ``require-not`` shape and
+        neither may emit the bare subpath read deny for that dir.
+        """
+        home = str(Path.home())
+        aws = os.path.join(home, ".aws")
+        cfg = os.path.join(aws, "config")
+        profile = _build_seatbelt_profile(
+            "strict", extra_hidden_dirs=(aws,), extra_expose_files=(cfg,)
+        )
+        assert f'(deny file-read* (subpath "{aws}"))' not in profile
+        assert f'(require-not (literal "{cfg}"))' in profile
+        assert f'(deny file-write* (subpath "{aws}"))' in profile
+
+    def test_extra_expose_file_outside_any_hidden_dir_emits_nothing(self):
+        """No deny to carve out of means no rule at all -- never a bare allow."""
+        profile = _build_seatbelt_profile(
+            "standard",
+            extra_hidden_dirs=("/h/u/.kube",),
+            extra_expose_files=("/h/u/.aws/config",),
+        )
+        assert ".aws/config" not in profile
+        assert '(deny file-read* (subpath "/h/u/.kube"))' in profile
+
     def test_extra_hidden_directory_denies_reads_and_writes(self):
         profile = _build_seatbelt_profile(
             "strict",
@@ -443,7 +524,11 @@ _EXPOSE_BLOCK_END = "# Bind-mount empty dirs over credential paths"
 _EXPOSE_SLICE_LANDMARKS = (
     "for src_path, filename in EXPOSE_FILES:",  # the loop
     "os.path.isfile(src_path)",  # the absent-file guard
-    'open(src_path, "rb")',  # the read itself
+    "os.path.islink(parent) or os.path.islink(src_path)",  # the symlink refusal
+    "os.O_NOFOLLOW",  # the read itself, link-proof
+    "os.O_DIRECTORY",  # the parent is opened as a real directory
+    "dir_fd=dir_fd",  # the leaf resolves relative to that descriptor
+    "stat.S_ISREG(os.fstat(fd).st_mode)",  # the regular-file check on the fd
 )
 
 
@@ -484,7 +569,7 @@ def _run_expose_pre_read(
     block.write_text(_expose_pre_read_source(), encoding="utf-8")
     result = runpy.run_path(
         str(block),
-        init_globals={"os": os, "sys": fake_sys, "EXPOSE_FILES": expose_files},
+        init_globals={"os": os, "sys": fake_sys, "stat": stat, "EXPOSE_FILES": expose_files},
     )
     return result["expose_data"], "".join(written)
 
@@ -585,14 +670,17 @@ class TestCcExposePreReadIsNonFatal:
             def access(self, path, mode) -> bool:
                 return True
 
+            def open(self, path, *args, **kwargs):
+                return _counting_os_open(path, *args, **kwargs)
+
             def __getattr__(self, name: str):
                 return getattr(os, name)
 
-        real_open = open
+        real_os_open = os.open
 
-        def _counting_open(path, *args, **kwargs):
+        def _counting_os_open(path, *args, **kwargs):
             opened.append(str(path))
-            return real_open(path, *args, **kwargs)
+            return real_os_open(path, *args, **kwargs)
 
         written: list[str] = []
 
@@ -609,16 +697,155 @@ class TestCcExposePreReadIsNonFatal:
             init_globals={
                 "os": _LyingOs(),
                 "sys": fake_sys,
-                "open": _counting_open,
+                "stat": stat,
                 "EXPOSE_FILES": [(str(src), "config")],
             },
         )
 
         # A pre-flight os.access guard would have skipped the open entirely and
         # emitted nothing, so BOTH of these fail on that rewrite.
-        assert opened == [str(src)], "the read must be attempted, not gated on os.access"
+        # Two opens: the parent directory, then the leaf by basename relative
+        # to it. Either proves the read was attempted rather than gated.
+        assert opened == [
+            str(src.parent),
+            src.name,
+        ], "the read must be attempted, not gated on os.access"
         assert "".join(written), "the denied read must still be reported"
         assert str(src) not in result["expose_data"]
+
+    def test_a_symlinked_expose_source_is_refused(self, tmp_path: Path) -> None:
+        """The restore copies whatever was read into the masked mount as a readable file.
+
+        A symlink at ``~/.aws/config`` pointing at ``~/.aws/credentials`` (or at
+        any HIDDEN-tier secret) would therefore carry the link TARGET's bytes past
+        the credential mask. The pre-read refuses the link outright, so the
+        carve-out is bounded to the one regular file the operator named.
+        Revert-verified: with a plain ``open()`` this reads the target.
+        """
+        secret = tmp_path / "credentials"
+        secret.write_bytes(b"aws_secret_access_key = SHOULD-NOT-LEAK\n")
+        link = tmp_path / "config"
+        link.symlink_to(secret)
+
+        expose_data, stderr = _run_expose_pre_read(
+            expose_files=[(str(link), "config")], tmp_path=tmp_path
+        )
+
+        assert str(link) not in expose_data, "a symlinked source must not be exposed"
+        assert b"SHOULD-NOT-LEAK" not in b"".join(expose_data.values())
+        assert str(link) in stderr and "symlink" in stderr
+
+    def test_a_symlinked_parent_directory_is_refused(self, tmp_path: Path) -> None:
+        """``O_NOFOLLOW`` on the full path only guards the LAST component.
+
+        ``~/.aws -> ~/.docker`` with a regular ``~/.docker/config`` would pass a
+        leaf-only check and copy Docker's credential store into the sandbox
+        under the name ``~/.aws/config``. The parent is opened with
+        ``O_DIRECTORY|O_NOFOLLOW`` and the leaf resolved via ``dir_fd``, so the
+        link is refused at the directory. Revert-verified: a full-path open
+        reads the target.
+        """
+        real_dir = tmp_path / "docker"
+        real_dir.mkdir()
+        (real_dir / "config").write_bytes(b"docker-auth = SHOULD-NOT-LEAK\n")
+        link_dir = tmp_path / "aws"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+        src = link_dir / "config"
+
+        expose_data, stderr = _run_expose_pre_read(
+            expose_files=[(str(src), "config")], tmp_path=tmp_path
+        )
+
+        assert str(src) not in expose_data
+        assert b"SHOULD-NOT-LEAK" not in b"".join(expose_data.values())
+        assert str(src) in stderr and "symlink" in stderr
+
+    def test_a_parent_symlink_swapped_in_after_the_islink_check_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The guard for the parent is ``O_DIRECTORY|O_NOFOLLOW`` on its open, not islink."""
+        real_dir = tmp_path / "docker"
+        real_dir.mkdir()
+        (real_dir / "config").write_bytes(b"docker-auth = SHOULD-NOT-LEAK\n")
+        link_dir = tmp_path / "aws"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+        src = link_dir / "config"
+
+        class _LyingIslink:
+            def islink(self, path) -> bool:
+                return False
+
+            def __getattr__(self, name: str):
+                return getattr(os, name)
+
+        written: list[str] = []
+
+        class _Stderr:
+            def write(self, text: str) -> int:
+                written.append(text)
+                return len(text)
+
+        fake_sys = type("_sys", (), {"stderr": _Stderr()})()
+        block = tmp_path / "_expose_block_parent_toctou.py"
+        block.write_text(_expose_pre_read_source(), encoding="utf-8")
+        result = runpy.run_path(
+            str(block),
+            init_globals={
+                "os": _LyingIslink(),
+                "sys": fake_sys,
+                "stat": stat,
+                "EXPOSE_FILES": [(str(src), "config")],
+            },
+        )
+
+        assert str(src) not in result["expose_data"]
+        assert b"SHOULD-NOT-LEAK" not in b"".join(result["expose_data"].values())
+        assert "".join(written), "the refused link must still be reported"
+
+    def test_a_symlink_swapped_in_after_the_islink_check_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The islink pre-check is a courtesy for the warning text, not the guard.
+
+        The guard is ``O_NOFOLLOW`` on the open itself plus ``S_ISREG`` on the
+        resulting fd, so a link planted between the check and the open is still
+        refused. Simulated by handing the block an ``os`` whose ``islink`` lies.
+        """
+        secret = tmp_path / "credentials"
+        secret.write_bytes(b"aws_secret_access_key = SHOULD-NOT-LEAK\n")
+        link = tmp_path / "config"
+        link.symlink_to(secret)
+
+        class _LyingIslink:
+            def islink(self, path) -> bool:
+                return False
+
+            def __getattr__(self, name: str):
+                return getattr(os, name)
+
+        written: list[str] = []
+
+        class _Stderr:
+            def write(self, text: str) -> int:
+                written.append(text)
+                return len(text)
+
+        fake_sys = type("_sys", (), {"stderr": _Stderr()})()
+        block = tmp_path / "_expose_block_toctou.py"
+        block.write_text(_expose_pre_read_source(), encoding="utf-8")
+        result = runpy.run_path(
+            str(block),
+            init_globals={
+                "os": _LyingIslink(),
+                "sys": fake_sys,
+                "stat": stat,
+                "EXPOSE_FILES": [(str(link), "config")],
+            },
+        )
+
+        assert str(link) not in result["expose_data"]
+        assert b"SHOULD-NOT-LEAK" not in b"".join(result["expose_data"].values())
+        assert "".join(written), "the refused link must still be reported"
 
     def test_one_unreadable_source_does_not_block_the_others(self, tmp_path: Path) -> None:
         """The skip is per entry, not per loop.
