@@ -64,7 +64,7 @@ from typing import Any, Iterator
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
-from kiro_crew.platform_compat import file_lock
+from kiro_crew.platform_compat import file_lock, is_link_or_junction
 from kiro_crew.session_ledger import _store_name
 
 logger = logging.getLogger(__name__)
@@ -466,15 +466,23 @@ def _work_ledger_root() -> Path:
 
 
 def conductor_dir(slot_key: str) -> Path:
-    """The directory holding *slot_key*'s ledger. Does not create it."""
+    """The directory holding *slot_key*'s ledger. Does not create it.
+
+    Same guard shape as :func:`binding_path`, for the same reason: the
+    two-``resolve()`` comparison this replaces is raceable on Windows even with
+    no ``os.replace`` in sight — the two ``_getfinalpathname`` probes only have
+    to fail with DIFFERENT winerrors, and a concurrent ``mkdir`` of the base
+    between them (two sessions creating their first ledgers at once) is enough
+    to keep the ``\\\\?\\`` prefix on one side and not the other. See
+    :func:`binding_path` for the full mechanics.
+    """
     if not slot_key or "\0" in slot_key or "/" in slot_key or "\\" in slot_key:
         raise WorkLedgerError(
             f"invalid slot key for work ledger: {slot_key!r}", code=CODE_INVALID_VALUE
         )
-    base = _work_ledger_root()
-    resolved = (base / _store_name(slot_key)).resolve()
-    parent = base.resolve()
-    if resolved == parent or not resolved.is_relative_to(parent):
+    base = _work_ledger_root().resolve()
+    resolved = base / _store_name(slot_key)
+    if resolved.parent != base or is_link_or_junction(resolved):
         raise WorkLedgerError(
             f"path traversal blocked for slot key: {slot_key!r}", code=CODE_INVALID_VALUE
         )
@@ -508,14 +516,39 @@ def binding_path(worker_slot_key: str) -> Path:
     than the digest alone: the fold is strictly more collision-resistant (a
     collision needs both the same sanitised prefix and the same digest), and it
     keeps one naming scheme across the store instead of two.
+
+    ``resolve()`` is called on the STABLE base directory only — NEVER on the
+    composed leaf. CPython's Windows ``realpath`` (non-strict) verifies its
+    ``\\\\?\\`` prefix strip with a second ``_getfinalpathname`` open; whenever
+    the two probes fail with DIFFERENT winerrors the prefix is KEPT, so the old
+    two-``resolve()`` comparison could see a prefixed child against an
+    unprefixed parent, read the mismatch as an escape, and turn a clean
+    ``already_bound`` refusal into ``invalid_value`` (issue #9343 — the same
+    Windows file-handling family as the lock-truncation fixes, at the resolve
+    step instead of the open). Two concurrent binds hit exactly that window:
+    the winner ``os.replace``\\ s the very binding record whose path the loser
+    is composing. A single resolve of the base cannot disagree with itself, and
+    the base is a directory nothing replaces.
+
+    Containment does not need the leaf resolved: the key is refused above on a
+    null byte, and the :func:`_store_name` fold strips separators and always
+    appends ``-<8 hex>``, so the leaf is one plain component by construction.
+    The one property the leaf resolve DID provide — refusing a pre-planted
+    symlink or junction at the record's own name — is kept via
+    :func:`is_link_or_junction`, which answers ``False`` on a transient
+    ``OSError`` instead of raising: a planted link is persistent and always
+    seen, while a momentary attribute error is the concurrent-replace window
+    on a regular file, exactly the case that must not become a refusal.
+    (The ``.lock`` sibling :func:`binding_lock` derives is not link-checked —
+    unchanged from before, when the resolve never looked at it either.)
     """
     if not worker_slot_key or "\0" in worker_slot_key:
         raise WorkLedgerError(
             f"invalid worker slot key: {worker_slot_key!r}", code=CODE_INVALID_VALUE
         )
-    base = bindings_dir()
-    resolved = (base / f"{_store_name(worker_slot_key)}.json").resolve()
-    if not resolved.is_relative_to(base.resolve()):
+    base = bindings_dir().resolve()
+    resolved = base / f"{_store_name(worker_slot_key)}.json"
+    if resolved.parent != base or is_link_or_junction(resolved):
         raise WorkLedgerError(
             f"path traversal blocked for worker key: {worker_slot_key!r}",
             code=CODE_INVALID_VALUE,

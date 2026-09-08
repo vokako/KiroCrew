@@ -1365,7 +1365,13 @@ def test_two_conductors_binding_one_worker_at_once_yield_exactly_one_binding():
             wl.apply_conductor_action(key, "bind", item_id=item_id, worker_session_key=WORKER)
             records[key] = "bound"
         except wl.WorkLedgerError as exc:
-            records[key] = exc.code
+            # The expected refusal stays as the bare code so the counting
+            # assertions below stay exact; anything ELSE keeps its message,
+            # because a bare ``invalid_value`` withheld the one fact that named
+            # the cause on #9343 — the refusal text says WHICH value was
+            # refused (an item id, and whether it was empty, truncated, or
+            # well-formed; or a spuriously "traversal-blocked" path).
+            records[key] = exc.code if exc.code == wl.CODE_ALREADY_BOUND else f"{exc.code}: {exc}"
         except BaseException as exc:  # noqa: BLE001 — diagnostic: never swallow, always name
             records[key] = f"{type(exc).__name__}: {exc}"
 
@@ -1404,6 +1410,105 @@ def test_two_conductors_binding_one_worker_at_once_yield_exactly_one_binding():
         item = wl.read_work_item(key, item_id)
         assert item is not None
         assert (item.worker_session_key == WORKER) == ((key, item_id) == binding)
+
+
+def test_path_guards_resolve_only_the_stable_base_never_the_composed_leaf(monkeypatch):
+    """``binding_path`` and ``conductor_dir`` must never pass the composed leaf
+    to ``Path.resolve()`` — only the stable base directory.
+
+    This is the property whose absence made
+    ``test_two_conductors_binding_one_worker_at_once_yield_exactly_one_binding``
+    report ``invalid_value`` instead of ``already_bound`` on Windows only
+    (issue #9343). CPython's Windows ``realpath`` (non-strict) verifies its
+    ``\\\\?\\`` prefix strip with a SECOND ``_getfinalpathname`` open; whenever
+    the two probes fail with DIFFERENT winerrors — a losing ``bind`` racing the
+    winner's ``os.replace`` on the same binding record, or a first
+    ``ensure_conductor`` racing another session's ``mkdir`` of the base — the
+    prefix is KEPT. The old guards compared two independent ``resolve()``
+    calls, so a prefixed child against an unprefixed parent read as a path
+    escape and raised ``invalid_value``. POSIX ``realpath`` has no prefix-strip
+    verification, which is why the defect was invisible on Linux.
+
+    Not resolving the leaf is the direct, platform-independent observable:
+    record every ``resolve()`` receiver and assert neither guard's leaf is
+    among them. Containment stays: hostile raw keys are still refused, and a
+    planted link at either leaf is refused through
+    ``platform_compat.is_link_or_junction`` (pinned separately below).
+    """
+    resolved_targets: list[Path] = []
+    original_resolve = Path.resolve
+
+    def recording(self: Path, *args, **kwargs) -> Path:
+        resolved_targets.append(self)
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", recording)
+    leaf_names = {wl.binding_path(WORKER).name, wl.conductor_dir(CONDUCTOR).name}
+    assert all(target.name not in leaf_names for target in resolved_targets), (
+        "a composed leaf path was passed to Path.resolve(); on Windows that "
+        "resolve can race a concurrent filesystem change and mis-report a "
+        "clean refusal as invalid_value — resolved: "
+        f"{[str(t) for t in resolved_targets]}"
+    )
+    # The guards still refuse what they exist to refuse.
+    with pytest.raises(wl.WorkLedgerError) as excinfo:
+        wl.conductor_dir("evil/../key")
+    assert excinfo.value.code == wl.CODE_INVALID_VALUE
+    with pytest.raises(wl.WorkLedgerError) as excinfo:
+        wl.binding_path("has\0null")
+    assert excinfo.value.code == wl.CODE_INVALID_VALUE
+
+
+def test_a_planted_link_at_a_guarded_leaf_is_refused(tmp_path):
+    """A pre-planted symlink at either guard's composed leaf must be refused.
+
+    The guards no longer resolve their leaves (see the test above for why), so
+    containment against a planted link comes from an explicit
+    ``platform_compat.is_link_or_junction`` rejection instead, and this test
+    holds that replacement to the old resolve's bar. Skipped where symlinks
+    cannot be created (Windows without privilege); the junction limb — which
+    needs no privilege on Windows but cannot be created on POSIX at all — is
+    pinned through the patched helper in the next test, the same way
+    ``test_papyrus_store`` pins its junction refusals.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.json").write_text("{}", encoding="utf-8")
+
+    linked_dir = wl._work_ledger_root() / wl._store_name(CONDUCTOR)
+    linked_dir.parent.mkdir(parents=True, exist_ok=True)
+    linked_binding = wl.bindings_dir() / f"{wl._store_name(WORKER)}.json"
+    linked_binding.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        linked_dir.symlink_to(outside, target_is_directory=True)
+        linked_binding.symlink_to(outside / "victim.json")
+    except OSError:
+        pytest.skip("cannot create symlinks on this platform/account")
+    with pytest.raises(wl.WorkLedgerError) as excinfo:
+        wl.conductor_dir(CONDUCTOR)
+    assert excinfo.value.code == wl.CODE_INVALID_VALUE
+    with pytest.raises(wl.WorkLedgerError) as excinfo:
+        wl.binding_path(WORKER)
+    assert excinfo.value.code == wl.CODE_INVALID_VALUE
+
+
+def test_a_junction_at_a_guarded_leaf_is_refused_through_the_shared_helper(monkeypatch):
+    """The junction limb of the leaf guard, pinned on every platform.
+
+    ``os.path.isjunction`` is a hard ``return False`` off Windows and a real
+    junction cannot be created there, so the behaviour is asserted through the
+    patched shared helper rather than by creating one — the pattern
+    ``test_papyrus_store`` established. This is what stops the
+    ``is_link_or_junction`` call being swapped for a bare ``islink`` (which
+    does NOT report a Windows directory junction) with the suite still green.
+    """
+    monkeypatch.setattr(wl, "is_link_or_junction", lambda path: True)
+    with pytest.raises(wl.WorkLedgerError) as excinfo:
+        wl.binding_path(WORKER)
+    assert excinfo.value.code == wl.CODE_INVALID_VALUE
+    with pytest.raises(wl.WorkLedgerError) as excinfo:
+        wl.conductor_dir(CONDUCTOR)
+    assert excinfo.value.code == wl.CODE_INVALID_VALUE
 
 
 def test_acquiring_a_lock_does_not_truncate_the_lock_file():
