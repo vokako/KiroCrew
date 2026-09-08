@@ -609,11 +609,22 @@ async def api_instances_connect(request: web.Request) -> web.Response:
             {"error": "instances manager not running", "code": "instances_manager_unavailable"},
             status=503,
         )
+    # `?rebuild=1` is the pane's Retry after a load watchdog fired on a document
+    # that DID navigate: every probe says the tunnel is fine, yet one stream in it
+    # stalled and the pane will wait on it forever. Only a fresh forwarder (new
+    # TCP path, new local port) clears that; the idempotent connect would hand
+    # the same stalled tunnel straight back. Opt-in and explicit so the
+    # auto-connect fan-out and plain tab clicks keep their no-op-when-up cost.
+    rebuild = request.query.get("rebuild") in ("1", "true")
     try:
-        status = await mgr.connect(instance_id)
+        # Keyword only when asked: the default call keeps the manager's existing
+        # positional contract (and every fake that implements it).
+        status = await (mgr.connect(instance_id, rebuild=True) if rebuild else mgr.connect(instance_id))
     except KeyError:
         _audit("connect", "denied", request_id=instance_id, error="not found")
         return web.json_response({"error": "not found", "code": "instance_not_found"}, status=404)
+    if rebuild:
+        _audit("connect", "rebuild", request_id=instance_id)
     body = status.to_dict()
     if status.state.value == "connected":
         token = mgr.get_token(instance_id)

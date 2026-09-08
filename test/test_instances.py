@@ -1662,6 +1662,45 @@ class TestSshTunnelManager:
         assert (await mgr.connect("cd-1")).state == TunnelState.CONNECTED
 
     @pytest.mark.asyncio
+    async def test_connect_rebuild_replaces_a_connected_tunnel(self, tmp_path):
+        """``rebuild=True`` is the pane's Retry after a watchdog verdict on a
+        document that DID navigate: every probe says the tunnel is fine, so the
+        idempotent connect would hand the same (stalled) forwarder back. The
+        rebuild must stop the old child, spawn a new one, keep the user's
+        connect intent, and answer CONNECTED with a live token."""
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        first = await mgr.connect("cd-1")
+        assert first.state == TunnelState.CONNECTED
+        old_tunnel = mgr._tunnels["cd-1"]
+
+        second = await mgr.connect("cd-1", rebuild=True)
+        assert second.state == TunnelState.CONNECTED
+        assert mgr._tunnels["cd-1"] is not old_tunnel, "a rebuild must spawn a new forwarder"
+        assert old_tunnel.stopped, "the stalled forwarder must be stopped, not orphaned"
+        assert mgr.get_token("cd-1") == "SECRET_TOK"
+        inst = reg.get("cd-1")
+        assert inst.was_connected is True, "rebuild keeps the connect intent (keep_intent)"
+        assert inst.local_port == second.local_port
+        assert inst.local_port >= mgr._allocator.base_port
+        # A plain connect afterwards is idempotent on the NEW tunnel.
+        assert (await mgr.connect("cd-1")).state == TunnelState.CONNECTED
+        assert mgr._tunnels["cd-1"] is not old_tunnel
+
+    @pytest.mark.asyncio
+    async def test_connect_rebuild_with_no_tunnel_is_a_plain_connect(self, tmp_path):
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        st = await mgr.connect("cd-1", rebuild=True)
+        assert st.state == TunnelState.CONNECTED
+        assert mgr.get_token("cd-1") == "SECRET_TOK"
+
+    @pytest.mark.asyncio
     async def test_connect_resets_recover_attempts(self, tmp_path):
         reg, mgr = self._mgr(tmp_path)
         reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
@@ -2377,6 +2416,45 @@ class TestHandlers:
         # list must NOT leak the token
         r = asyncio.run(handlers.api_instances_list(_FakeReq(state)))
         assert "SECRET_TOK" not in r.body.decode()
+
+    def test_connect_rebuild_query_reaches_the_manager(self, tmp_path, monkeypatch):
+        """``?rebuild=1`` is the pane's Retry after a watchdog verdict; it must be
+        forwarded as ``rebuild=True`` and nothing else about the response changes.
+        Without the flag the manager is called with its plain positional
+        contract, so every existing caller (and fake) keeps working."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, TunnelStatus
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        calls = []
+
+        class FakeMgr:
+            async def connect(self, iid, *, rebuild=False):
+                calls.append(rebuild)
+                reg.update(iid, was_connected=True, local_port=7778)
+                return TunnelStatus(iid, TunnelState.CONNECTED, local_port=7778, remote_port=7777)
+
+            def get_token(self, iid):
+                return "SECRET_TOK"
+
+            async def token_validates(self, local_port, token):
+                return True
+
+        state = _State(reg, FakeMgr())
+        r = asyncio.run(handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"})))
+        assert r.status == 200
+        r = asyncio.run(
+            handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"}, query={"rebuild": "1"}))
+        )
+        assert r.status == 200 and _body(r)["token"] == "SECRET_TOK"
+        r = asyncio.run(
+            handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"}, query={"rebuild": "0"}))
+        )
+        assert r.status == 200
+        assert calls == [False, True, False]
 
     def test_connect_remints_when_stored_token_stale(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers

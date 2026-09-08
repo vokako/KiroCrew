@@ -1403,7 +1403,7 @@ class SshTunnelManager:
             timeout_secs=self._mint_timeout_for(params.method),
         )
 
-    async def connect(self, instance_id: str) -> TunnelStatus:
+    async def connect(self, instance_id: str, *, rebuild: bool = False) -> TunnelStatus:
         """Open a tunnel + mint a token for *instance_id*; return its status.
 
         Idempotent: connecting an already-connected instance returns its current
@@ -1411,6 +1411,17 @@ class SshTunnelManager:
         validation / mint / spawn error via the returned status (state ERROR).
         Works for either ``connection_method`` — the transport is resolved by
         :meth:`_resolve_transport`.
+
+        ``rebuild=True`` breaks the idempotence on purpose: a CONNECTED tunnel is
+        torn down first (``keep_intent`` — the user is asking for the crew, not
+        turning it off) and a fresh forwarder is spawned on a freshly allocated
+        port. This is the pane's Retry after a load watchdog fired on a document
+        that DID navigate: the transport is up by every probe the manager runs
+        (``/api/health`` answers, the credential validates), yet one stream
+        inside it stalled and the pane's module graph will wait on it forever.
+        Nothing short of a new TCP path clears that, and the plain connect —
+        which sees CONNECTED and returns — would hand the same stalled tunnel
+        back.
         """
         async with self._lock:
             inst = await asyncio.to_thread(self._registry.get, instance_id)
@@ -1418,6 +1429,20 @@ class SshTunnelManager:
                 raise KeyError(f"no instance with id {instance_id!r}")
 
             existing = self._tunnels.get(instance_id)
+            if rebuild and existing is not None:
+                logger.info(
+                    "Rebuilding tunnel for %s on request (was %s on 127.0.0.1:%s)",
+                    instance_id,
+                    existing.status.state.value,
+                    existing.status.local_port,
+                )
+                await self._teardown_locked(instance_id, keep_intent=True)
+                existing = None
+                # The registry row was just rewritten (local_port reset); re-read
+                # so the allocation below skips nothing stale and records fresh.
+                inst = await asyncio.to_thread(self._registry.get, instance_id)
+                if inst is None:
+                    raise KeyError(f"no instance with id {instance_id!r}")
             if existing is not None and existing.status.state == TunnelState.CONNECTED:
                 return existing.status
             if existing is not None:

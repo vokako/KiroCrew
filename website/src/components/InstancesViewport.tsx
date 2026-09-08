@@ -73,6 +73,11 @@ const REFRESH_MIN_INTERVAL_MS = 10_000
 // deps below precisely so that a re-mint arriving inside the window cannot
 // postpone it.
 const PANE_LOAD_TIMEOUT_MS = 15_000
+// Gap between successive auto-warm iframe mounts on first load (see the
+// auto-warm effect). Long enough for a tunnel's shell + entry bundle to land
+// before the next pane starts pulling its own; short enough that four panes
+// are all warm within the time the user spends reading the Local tab.
+const AUTO_WARM_STAGGER_MS = 1_500
 // How many reactive re-mints one pane may ask for before the parent stops
 // answering. The child posts `mc-auth-expired` on EVERY 403 it sees
 // (api/client.ts hands recovery to the hub before it latches its own banner),
@@ -442,7 +447,8 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     // (via=retry). Retry can "succeed" as a request while warming nothing, and
     // the pane then reloads into the same stuck state — that case is the
     // `warm-declined` line the step emits.
-    mutationFn: (id: string) => connectInstanceInto(dispatch, id, 'retry'),
+    mutationFn: ({ id, rebuild }: { id: string; rebuild: boolean }) =>
+      connectInstanceInto(dispatch, id, 'retry', { rebuild }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['instances'] })
     },
@@ -457,6 +463,10 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // src would otherwise not reload a dead frame).
   const [timedOut, setTimedOut] = useState<Record<string, boolean>>({})
   const [reloadSeq, setReloadSeq] = useState<Record<string, number>>({})
+  // Live mirror of `timedOut` for `retry`, which must read the verdict at press
+  // time without re-creating itself on every watchdog flip.
+  const timedOutRef = useRef(timedOut)
+  timedOutRef.current = timedOut
   const activeWarmConn = activeId ? warm[activeId] : undefined
   // Apply the INCOMING pane's chrome state at switch time. The store otherwise
   // keeps whatever the outgoing surface last reported — and a switch necessarily
@@ -524,19 +534,30 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
 
   const retry = useCallback(
     (id: string) => {
+      const frame = frameDocumentState(iframeRefs.current.get(id))
+      // A watchdog verdict on a document that DID navigate is the one case a
+      // plain reconnect cannot fix: the tunnel answers every probe, so the
+      // idempotent connect returns the same forwarder, and the pane reloads
+      // into the same stalled module graph (one hashed-chunk stream that never
+      // finishes over that TCP path). Ask the gateway to rebuild the tunnel —
+      // new forwarder, new local port — so the reload gets a new path. A pane
+      // that never navigated (`about:blank`) or whose connect itself failed
+      // keeps the cheap path: there is no stalled stream to escape.
+      const rebuild = !!timedOutRef.current[id] && frame === 'cross-origin'
       // Clear the stale verdict and force a reload even if the re-mint returns
       // an identical token (setWarm would be a no-op for the iframe src).
       paneLog('retry', {
         id,
         port: warmRef.current[id]?.port,
-        frame: frameDocumentState(iframeRefs.current.get(id)),
+        frame,
+        rebuild: rebuild || undefined,
       })
       setTimedOut(prev => ({ ...prev, [id]: false }))
       setReloadSeq(prev => ({ ...prev, [id]: (prev[id] || 0) + 1 }))
       // An explicit user press is a fresh start: re-open the reactive budget so
       // a pane that recovers on the next token can still self-heal afterwards.
       reactiveMintsRef.current.delete(id)
-      connectMutation.mutate(id)
+      connectMutation.mutate({ id, rebuild })
     },
     [connectMutation],
   )
@@ -591,6 +612,19 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // activeId: the dashboard always lands on the Local tab and the warmed iframes
   // sit hidden and ready. Down instances are skipped (they stay sticky error
   // tabs); this runs once per mount. warmRef avoids re-firing on warm changes.
+  //
+  // Staggered, not simultaneous. Each warm mounts an iframe that immediately
+  // pulls a ~4 MB module graph (~240 hashed chunks) over a just-opened SSH
+  // tunnel, and the tunnels themselves were raised seconds earlier by the
+  // auto-connect fan-out. Four panes cold-loading in the same second is the
+  // exact condition under which one stream stalled and its pane never
+  // finished loading (see pane-asset-journal in the desktop shell). One warm
+  // per AUTO_WARM_STAGGER_MS keeps the loads sequential enough that a single
+  // tunnel's first bytes are not competing with three others' bulk transfer.
+  // The user's active pane is never delayed by this: it is warmed by the
+  // select path, not here.
+  const autoWarmTimersRef = useRef<number[]>([])
+  useEffect(() => () => { for (const t of autoWarmTimersRef.current) window.clearTimeout(t) }, [])
   const didAutoWarmRef = useRef(false)
   useEffect(() => {
     const data = instancesQuery.data
@@ -601,7 +635,16 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     const candidates = data.instances
       .filter(i => i.status?.state === 'connected' && !warmRef.current[i.id])
       .slice(0, room)
-    for (const inst of candidates) void autoWarm(inst.id)
+    // Timers live in a ref and are cleared only on unmount: this effect re-runs
+    // on every instances poll (its deps include the query data), and a cleanup
+    // returned from it would cancel the pending warms after the first poll
+    // while the once-only guard above stops them from ever being re-armed.
+    autoWarmTimersRef.current = candidates.map((inst, i) =>
+      window.setTimeout(() => {
+        if (i > 0) paneLog('auto-warm-staggered', { id: inst.id, index: i, delayMs: i * AUTO_WARM_STAGGER_MS })
+        void autoWarm(inst.id)
+      }, i * AUTO_WARM_STAGGER_MS),
+    )
   }, [instancesQuery.data, warmCap, autoWarm])
 
   const warmIds = useMemo(() => Object.keys(warm), [warm])
