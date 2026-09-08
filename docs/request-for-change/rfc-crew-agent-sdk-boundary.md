@@ -899,11 +899,57 @@ Exit criteria, as verified on the merged tree:
 - Verified: `./scripts/docs-lint.sh` passes and the host-contract spec is
   reachable from `docs/system-specs/modules/README.md`.
 
-### PR 2 — the SDK owns the types
+### PR 2 — the SDK owns the types — **constants half LANDED (PR 2a)**
 
 `AgentEvent`, `ApprovalToken`, `ToolStatus`, `CompactionResult`,
 `SessionCapabilities`, the error taxonomy including `AgentRuntimeMissing`, and the
 driver translation. `providers/base.py` stops aliasing `AcpEvent`.
+
+**PR 2a — the event and stop-reason vocabulary — LANDED.** The strings came
+first because they are the one part of PR 2 that needs no shim mechanism at all:
+a constant has no fields to deprecate, so the move is a re-export and nothing
+above the boundary changes. `kiro_crew.agent_sdk.events` now declares the 19
+`EVENT_*` kinds, a frozenset `ALL_EVENT_KINDS` over them, and the six
+provider-neutral `STOP_REASON_*` reasons; `kiro_crew.acp.types` re-exports every
+name, so each existing `from kiro_crew.acp.types import EVENT_TOOL_CALL` call
+site is untouched. `agent_sdk/__init__` exports them too, and its two
+`TURN_STOP_REASON_*` names became aliases of the moved reasons rather than a
+second spelling of the same literals.
+
+Three things this slice settled that the rest of PR 2 inherits:
+
+- **One reason stayed behind.** `STOP_REASON_CONTENT_FILTERED_WIRE` is a harness's
+  own spelling, normalised to `STOP_REASON_REFUSAL` before any consumer sees it.
+  It is a wire literal the parser and its tests share, not vocabulary application
+  code compares against, so promoting it would export a name nothing above the
+  boundary reads. `test_agent_sdk_events.py` pins it in `acp/types.py` and out of
+  the SDK, in both directions.
+- **Identity alone cannot prove the move.** CPython interns short
+  identifier-like constants, so `acp/types.py` re-declaring `"cancelled"` would
+  satisfy an `is` assertion against the SDK's copy. The anti-drift gate is
+  therefore structural: an AST pass asserts `acp/types.py` assigns no `EVENT_*`
+  or `STOP_REASON_*` name of its own, with the wire literal as the single
+  recorded exception.
+- **The direction is checked twice.** The import gate exempts `agent_sdk/`
+  wholly, so a re-export pointing the wrong way is invisible to it — which is the
+  `LLMEvent = AcpEvent` channel that made two forbidden roots necessary. The new
+  tests read the module's own imports AND import it first in a fresh interpreter,
+  asserting no `kiro_crew.acp` module loads. The second half is what catches an
+  edge added lazily inside a function. Both match on the dotted root, never a
+  string prefix, so the `acp_backends` neighbour is not miscounted.
+
+Exit criteria, as verified on the merged tree:
+
+- Verified: no file outside `acp/`, `agent_sdk/`, `test/` and `docs/` changed, so
+  the re-export set is complete.
+- Verified: every replay snapshot under `test/fixtures/acp_frames/` is
+  byte-identical, and every `kind` they emit is a kind the SDK now defines.
+- Verified: `test/test_agent_lifecycle_cycle.py` still passes — the ACP layer
+  importing the SDK's leaf closes no cycle, because every `kiro_crew.acp` import
+  in `agent_sdk/drivers/acp.py` is function-local.
+- Verified: the boundary baseline did not grow. It did not shrink either: the
+  `EVENT_*` re-export in `providers/base.py` is still an ACP edge, and it is
+  PR 5's wave that pays it off.
 
 **PR 2 is additive only if `AgentEvent` carries deprecation shims, and it must.**
 An earlier draft claimed consumers "keep working through the deprecated shim"

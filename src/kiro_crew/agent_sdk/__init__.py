@@ -59,10 +59,42 @@ from kiro_crew.agent_sdk.backend_install import (
     probe_backend,
     probe_backends,
 )
+from kiro_crew.agent_sdk.events import (
+    ALL_EVENT_KINDS,
+    EVENT_AGENT_SWITCHED,
+    EVENT_CLEAR_STATUS,
+    EVENT_COMPACTION_STATUS,
+    EVENT_COMPLETE,
+    EVENT_MCP_OAUTH_REQUEST,
+    EVENT_MCP_SERVER_INIT_FAILURE,
+    EVENT_MCP_SERVER_INITIALIZED,
+    EVENT_PERMISSION_REQUEST,
+    EVENT_STEER_CLEARED,
+    EVENT_STEER_CONSUMED,
+    EVENT_STEER_QUEUED,
+    EVENT_SUBAGENT_ACTIVITY,
+    EVENT_SUBAGENT_LIST,
+    EVENT_TEXT_CHUNK,
+    EVENT_THINKING_CHUNK,
+    EVENT_TODO_UPDATE,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_CALL_UPDATE,
+    EVENT_TOOL_RESULT,
+    STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_END_TURN,
+    STOP_REASON_REFUSAL,
+    STOP_REASON_STALE_RECOVER,
+    STOP_REASON_TOOL_STALL,
+)
 from kiro_crew.agent_sdk.native_commands import NativeCommandBatch, run_kiro_native_commands
 
-TURN_STOP_REASON_CANCELLED = "cancelled"
-TURN_STOP_REASON_END_TURN = "end_turn"
+#: Historical spellings of the two terminal reasons, kept because
+#: ``monitoring/completion.py`` reads them. They are ALIASES, not a second
+#: definition: one literal per reason lives in
+#: :mod:`kiro_crew.agent_sdk.events`, so the two cannot drift apart.
+TURN_STOP_REASON_CANCELLED = STOP_REASON_CANCELLED
+TURN_STOP_REASON_END_TURN = STOP_REASON_END_TURN
 
 
 class AgentTurnUsage(Protocol):
@@ -74,6 +106,32 @@ class AgentTurnUsage(Protocol):
 
 __all__ = [
     "AgentTurnUsage",
+    "ALL_EVENT_KINDS",
+    "EVENT_AGENT_SWITCHED",
+    "EVENT_CLEAR_STATUS",
+    "EVENT_COMPACTION_STATUS",
+    "EVENT_COMPLETE",
+    "EVENT_MCP_OAUTH_REQUEST",
+    "EVENT_MCP_SERVER_INITIALIZED",
+    "EVENT_MCP_SERVER_INIT_FAILURE",
+    "EVENT_PERMISSION_REQUEST",
+    "EVENT_STEER_CLEARED",
+    "EVENT_STEER_CONSUMED",
+    "EVENT_STEER_QUEUED",
+    "EVENT_SUBAGENT_ACTIVITY",
+    "EVENT_SUBAGENT_LIST",
+    "EVENT_TEXT_CHUNK",
+    "EVENT_THINKING_CHUNK",
+    "EVENT_TODO_UPDATE",
+    "EVENT_TOOL_CALL",
+    "EVENT_TOOL_CALL_UPDATE",
+    "EVENT_TOOL_RESULT",
+    "STOP_REASON_CANCELLED",
+    "STOP_REASON_COMPACTION_FAILED",
+    "STOP_REASON_END_TURN",
+    "STOP_REASON_REFUSAL",
+    "STOP_REASON_STALE_RECOVER",
+    "STOP_REASON_TOOL_STALL",
     "CACHE_TTL_SECONDS",
     "COMPONENT_CLAUDE_ACP_ADAPTER",
     "COMPONENT_CLAUDE_CODE_CLI",

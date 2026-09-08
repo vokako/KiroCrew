@@ -39,29 +39,40 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     selectable_backends,
 )
 
-# ── ACP Event Kinds ──
-
-EVENT_TEXT_CHUNK = "text_chunk"
-EVENT_THINKING_CHUNK = "thinking_chunk"
-EVENT_TOOL_CALL = "tool_call"
-EVENT_TOOL_CALL_UPDATE = "tool_call_update"
-EVENT_TOOL_RESULT = "tool_result"
-EVENT_PERMISSION_REQUEST = "permission_request"
-EVENT_COMPLETE = "complete"
-EVENT_COMPACTION_STATUS = "compaction_status"
-EVENT_CLEAR_STATUS = "clear_status"
-EVENT_AGENT_SWITCHED = "agent_switched"
-EVENT_MCP_OAUTH_REQUEST = "mcp_oauth_request"
-# Agent's own task/TODO list snapshot, recovered from the `todo_list` tool's
-# rawOutput. Not an ACP-native update kind — see KIRO_TOOL_TODO_LIST.
-EVENT_TODO_UPDATE = "todo_update"
-EVENT_MCP_SERVER_INITIALIZED = "mcp_server_initialized"
-EVENT_MCP_SERVER_INIT_FAILURE = "mcp_server_init_failure"
-EVENT_SUBAGENT_LIST = "subagent_list"
-EVENT_SUBAGENT_ACTIVITY = "subagent_activity"
-EVENT_STEER_QUEUED = "steer_queued"
-EVENT_STEER_CONSUMED = "steer_consumed"
-EVENT_STEER_CLEARED = "steer_cleared"
+# The event-kind and stop-reason vocabulary is SDK-owned and lives in the leaf
+# module ``kiro_crew.agent_sdk.events`` (it imports nothing from this package,
+# which is what lets consumers read the vocabulary without reaching the ACP
+# layer). Re-exported here so every existing ``from kiro_crew.acp.types import
+# EVENT_*`` and ``STOP_REASON_*`` call site is unchanged — see the "Stop Reasons"
+# section below for the one reason that stays.
+from kiro_crew.agent_sdk.events import (  # noqa: F401 - re-exported for existing importers
+    ALL_EVENT_KINDS,
+    EVENT_AGENT_SWITCHED,
+    EVENT_CLEAR_STATUS,
+    EVENT_COMPACTION_STATUS,
+    EVENT_COMPLETE,
+    EVENT_MCP_OAUTH_REQUEST,
+    EVENT_MCP_SERVER_INIT_FAILURE,
+    EVENT_MCP_SERVER_INITIALIZED,
+    EVENT_PERMISSION_REQUEST,
+    EVENT_STEER_CLEARED,
+    EVENT_STEER_CONSUMED,
+    EVENT_STEER_QUEUED,
+    EVENT_SUBAGENT_ACTIVITY,
+    EVENT_SUBAGENT_LIST,
+    EVENT_TEXT_CHUNK,
+    EVENT_THINKING_CHUNK,
+    EVENT_TODO_UPDATE,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_CALL_UPDATE,
+    EVENT_TOOL_RESULT,
+    STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_END_TURN,
+    STOP_REASON_REFUSAL,
+    STOP_REASON_STALE_RECOVER,
+    STOP_REASON_TOOL_STALL,
+)
 
 # ── ACP Protocol Methods ──
 
@@ -258,36 +269,16 @@ OPTION_ALLOW_ALWAYS = "allow_always"
 
 # ── Stop Reasons ──
 
-STOP_REASON_CANCELLED = "cancelled"
-STOP_REASON_END_TURN = "end_turn"
-# Model-side content refusal ("response declined by the model"). Non-retryable:
-# retrying the same prompt hits the same refusal, so chat_runner surfaces an
-# actionable message instead of churning the retry ladder.
-STOP_REASON_REFUSAL = "refusal"
+# The provider-neutral reasons are re-exported from
+# ``kiro_crew.agent_sdk.events`` at the top of this module. Only the wire literal
+# below stays here: it never reaches a consumer.
+
 # The Kiro service's own spelling of a content-filter refusal, as it appears in
 # the ``stopReason`` field of a ``_kiro.dev/metadata`` notification. It is
 # NORMALISED to ``STOP_REASON_REFUSAL`` on the ``EVENT_COMPLETE`` that follows
 # (see ``RefusalInfo``), so no consumer outside ``acp/`` ever compares against
 # it; named here so the parser and its tests share one literal.
 STOP_REASON_CONTENT_FILTERED_WIRE = "CONTENT_FILTERED"
-# Signalled by the ACP layer when a genuinely-wedged (stale) turn was probed via
-# session/cancel and got no ack within the grace window — a confirmed wedge, not
-# a done-but-missing-frame turn (which acks and completes normally). The
-# dashboard routes this to reset+resume+continue-nudge auto-recovery.
-STOP_REASON_STALE_RECOVER = "stale_recover"
-# Signalled by the per-session watchdog when an in-flight tool was judged dead
-# / stuck / UNKNOWN-past-budget and the session was cancelled. Kept in the
-# "error:" family so callers without a dedicated branch fall back to the
-# generic error handling; chat_runner routes it to a dedicated recovery
-# (continue-nudge, NOT a verbatim re-run of the original message).
-STOP_REASON_TOOL_STALL = "error: tool stall"
-# Signalled by the ACP layer when automatic compaction reported `failed`
-# and the backend then abandoned the turn (no prompt response, no
-# end_turn) past the post-failure budget. Kept in the "error:" family so
-# callers without a dedicated branch fall back to generic error handling;
-# it deliberately triggers NO retry — the user-visible compaction notice
-# already explains what happened, and this only releases the slot.
-STOP_REASON_COMPACTION_FAILED = "error: compaction failed"
 
 # ── Approval Modes ──
 
