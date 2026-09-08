@@ -28,6 +28,7 @@ import functools
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import re
 import select
@@ -1438,6 +1439,321 @@ def _voice_runtime_ancestor_guards() -> tuple[str, ...]:
     prime_voice_runtime_sandbox_paths()
     assert _voice_runtime_paths_cache is not None
     return _voice_runtime_paths_cache[4]
+
+
+def _path_identity(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` for *path*, or ``None`` when it cannot be stat'd.
+
+    THE seam every identity comparison below goes through, so a path that
+    cannot be inspected (not created yet, an ancestor this process may not
+    traverse, a race that unlinks mid-walk) degrades to the spelling answer
+    instead of raising into the caller's spawn path.
+
+    ``os.lstat``, never ``stat``: these paths arrive from CONFIG TEXT, and the
+    final component is where a planted symlink could point at a remote or
+    stalling target -- following it would turn a local containment question into
+    off-host I/O (#9108 security review). Nothing is lost by refusing to follow,
+    because symlink resolution already happened upstream: the caller compares
+    the ``realpath`` spelling as well, and a link INTO the sealed parent is
+    caught there with every component resolved.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _identity_within_sealed_parent(path: str, parent: str) -> bool:
+    """Whether *path* is *parent* or lies inside it BY FILESYSTEM IDENTITY.
+
+    Spelling alone misses an alias the filesystem itself treats as the same
+    directory. On case-insensitive APFS ``<data home>/RUN`` and
+    ``<data home>/run`` are ONE directory, and ``realpath`` does not fold the
+    difference (it walks with ``lstat``/``readlink``, neither of which
+    canonicalizes case) -- so a differently-cased declaration walked straight
+    past the lexical predicate, the probe honored it, and the child got a TMPDIR
+    the seal had already made read-only (#9108). Identity is the filesystem's
+    own answer, which covers firmlink and normalization aliases for free.
+
+    A declared temp usually does NOT exist yet, so the walk simply climbs until
+    a component stats: the deepest EXISTING ancestor is what carries identity,
+    and if that ancestor is the sealed parent or lives under it then so does
+    every not-yet-created component below it -- *path* arrives resolved and
+    normalized, so no remainder can climb back out. Only the sealed parent's
+    identity is compared, never a case-folded spelling, so a case-SENSITIVE
+    filesystem keeps answering exactly as it did: there ``<data home>/RUN`` is a
+    different directory, it does not exist, and nothing seals it.
+
+    An unstat-able parent yields ``False`` rather than a folded-spelling guess.
+    :func:`_voice_runtime_parent_paths` primes and CREATES the sealed parent, so
+    that needs an out-of-band deletion race to reach -- and in that state
+    case-folding would mis-refuse a genuinely distinct ``RUN`` directory on a
+    case-sensitive filesystem, which is the worse answer: the OS seal is the
+    actual boundary, and this predicate only turns its EROFS into a clean
+    refusal (First Principles review round 1).
+    """
+    parent_identity = _path_identity(parent)
+    if parent_identity is None:
+        return False
+    current = path
+    while True:
+        if _path_identity(current) == parent_identity:
+            return True
+        next_up = os.path.dirname(current)
+        if next_up == current:
+            return False
+        current = next_up
+
+
+#: Two leading separators in either spelling — the shape EVERY remote or device
+#: Windows path opens with: ``\\server\share`` (UNC), ``\\?\`` and ``\\.\`` (the
+#: device namespace), and the ``\\?\UNC\server\share`` long form. Both directions
+#: are matched because Windows accepts either as a separator, so
+#: ``//server/share`` names the same share.
+_REMOTE_OR_DEVICE_PREFIX_RE = re.compile(r"^[\\/]{2}")
+
+
+def _remote_or_device_spelling(path: str) -> bool:
+    """Whether *path* names a REMOTE or DEVICE location by spelling alone.
+
+    Asked BEFORE any resolution, because on Windows the resolution IS the
+    remote access: ``os.path.realpath`` opens the path
+    (``GetFinalPathNameByHandle``) and ``stat`` follows it, so probing a
+    spec-declared UNC path opens an SMB connection to a host the config author
+    chose -- and a dead or slow host stalls the caller for the SMB timeout --
+    all inside a check whose only question was local containment (#9108
+    security review). The device namespace is refused for the same reason: it
+    reaches drivers and volume aliases no containment rule can reason about.
+
+    Refused on every platform, deliberately. The same config text is read on
+    whichever OS the gateway runs, so the answer must not depend on it, and a
+    POSIX declaration written with two leading slashes is only ever a redundant
+    spelling of a path the operator can also write with one.
+    """
+    return bool(_REMOTE_OR_DEVICE_PREFIX_RE.match(path))
+
+
+def _windows_drive_is_local(root: str) -> bool | None:
+    """Classify a Windows drive ROOT: local, not local, or nothing to classify.
+
+    THE platform seam for :func:`_remote_or_unmountable_drive_root`, and the only
+    place the Windows API call lives -- which is what lets the classification
+    logic above it run on a POSIX CI runner with this substituted.
+
+    ``None`` means there is no volume to classify, and that is the answer off
+    Windows: a drive letter is not a filesystem concept there, so the whole check
+    is a no-op rather than a refusal. On Windows the question goes to
+    :func:`kiro_crew.windows_acl.volume_is_local`, which asks ``GetDriveTypeW``
+    about the ROOT and therefore touches no file on the volume -- exactly the
+    property that makes it safe to ask BEFORE deciding whether the path may be
+    resolved at all. It allowlists the local drive kinds rather than denylisting
+    the remote one, so an unexpected or future value reads as not-local.
+
+    A probe that raises reports NOT local, never ``None``: a volume that could
+    not be inspected has cleared nothing, and collapsing that into the POSIX
+    no-op would turn a failed classification into a pass.
+    """
+    if sys.platform != "win32":
+        return None
+    try:  # pragma: no cover - Windows-only; the logic is tested via a substitute
+        from kiro_crew.windows_acl import volume_is_local
+
+        return volume_is_local(root)
+    except Exception:
+        return False
+
+
+def _remote_or_unmountable_drive_root(path: str) -> bool:
+    """Whether *path* names a drive whose ROOT is remote or cannot be mounted.
+
+    The mapped-drive spelling of the exposure :func:`_remote_or_device_spelling`
+    catches lexically, and the one it cannot see (#9108 security review, round
+    3). ``Z:\\tmp`` carries no two-leading-separator prefix, and when it is not a
+    symlink the link-chain scan finds nothing to judge -- yet if ``Z:`` is a
+    mapped SMB share then ``realpath`` opens it and makes the round-trip anyway.
+    A mapped drive is the COMMON enterprise spelling of a remote path, and no
+    string test separates ``Z:`` from a local disk, so the OS is asked instead --
+    about the root, which costs nothing on the volume itself.
+
+    Refused unless the drive is PROVABLY local, which also covers
+    ``DRIVE_NO_ROOT_DIR`` and ``DRIVE_UNKNOWN``. That follows the seal's own
+    semantics rather than being caution for its own sake: a root the OS cannot
+    mount or cannot classify is not ``<data home>/run``, so declining it gives up
+    nothing, and the caller's response -- fall back to the managed temp -- is what
+    an unverifiable declaration warrants.
+
+    Drive detection uses WINDOWS path semantics on every platform
+    (:func:`ntpath.splitdrive`), because whether the text names a drive is a
+    question about the SPELLING, not about the running OS. That decides nothing on
+    its own: a path with no drive component returns False without consulting the
+    probe, and on POSIX the probe reports ``None``, so the check stays a no-op
+    there even for a filename that happens to look drive-lettered.
+    """
+    drive = ntpath.splitdrive(path)[0]
+    if not drive:
+        return False
+    # GetDriveTypeW wants a ROOT; splitdrive yields ``Z:`` for a letter path and
+    # the whole ``\\server\share`` for a UNC one, so appending a separator
+    # produces the root in both shapes.
+    root = drive if drive.endswith(("\\", "/")) else drive + "\\"
+    is_local = _windows_drive_is_local(root)
+    if is_local is None:
+        return False
+    return not is_local
+
+
+#: Symlink hops :func:`_remote_or_device_in_link_chain` follows before refusing.
+#: Matches Linux's own ELOOP ceiling: the scan reads links itself, so it does not
+#: inherit the kernel's loop detection and must carry its own bound. No legitimate
+#: temp declaration routes through anywhere near this many links.
+_MAX_LINK_HOPS = 40
+
+
+def _remote_or_device_in_link_chain(path: str) -> bool:
+    """Whether RESOLVING *path* would traverse a link into a remote/device location.
+
+    :func:`_remote_or_device_spelling` judges the declaration as written, which
+    leaves one indirection open: an ordinary-looking local path can BE a symlink
+    (or a Windows junction / reparse point) whose target is a share, and
+    ``realpath`` follows it -- so the SMB connection happens inside the
+    containment check exactly as it would for a declared UNC path, with the
+    lexical guard never seeing it (#9108 security review, round 2).
+
+    Closed by resolving the path ourselves with no-follow primitives. Each
+    component is read with :func:`os.readlink`, which returns the link's OWN
+    contents and opens nothing, and the target is tested BEFORE the walk descends
+    into it -- so a remote target is refused without ever being reached. The walk
+    CHASES, because testing only the declared path's own components would clear a
+    first hop whose target is local and then hand ``realpath`` a chain that ends
+    on a share.
+
+    ``..`` is applied during the walk rather than collapsed up front, for the
+    reason its caller documents: normalizing first deletes the very link that
+    ``..`` was climbing out of.
+
+    Bounded, and the bound fails CLOSED. Reading links ourselves means the kernel
+    is not detecting cycles for us, so a hop cap stands in for ELOOP, and a path
+    whose canonical form cannot be established is refused -- the same answer every
+    other unverifiable declaration gets here. A component that cannot be read at
+    all (absent, not a link, not traversable) simply carries no redirection, so it
+    is walked through rather than refused; that is the ordinary case, since a
+    declared temp usually does not exist yet.
+    """
+    if not os.path.isabs(path):
+        # Anchored the way the lexical spelling is, but WITHOUT normpath, which
+        # would collapse ``..`` past a link before the walk could inspect it.
+        path = os.path.join(os.getcwd(), path)
+    try:
+        parts = list(Path(path).parts)
+    except (OSError, ValueError):
+        return True
+    if not parts:
+        return False
+    resolved, pending = parts[0], parts[1:]
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part == os.curdir:
+            continue
+        if part == os.pardir:
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, part)
+        try:
+            target = os.readlink(candidate)
+        except OSError:
+            # Not a link, or nothing there yet: no redirection to judge.
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > _MAX_LINK_HOPS:
+            return True
+        if _remote_or_device_spelling(target):
+            return True
+        try:
+            target_parts = list(Path(target).parts)
+        except (OSError, ValueError):
+            return True
+        if os.path.isabs(target):
+            resolved, pending = target_parts[0], target_parts[1:] + pending
+        else:
+            # A relative target resolves against the directory holding the link,
+            # which is exactly the ``resolved`` prefix already walked.
+            pending = target_parts + pending
+    return False
+
+
+def path_within_sealed_runtime_parent(path: str) -> bool:
+    """Whether *path* lands inside a runtime parent every backend seals read-only.
+
+    The question a caller must ask BEFORE it hands a sandboxed child a directory
+    that came from config text (#8747). ``<data home>/run`` is sealed read-only
+    on both backends, so a spec-declared ``TMPDIR`` under it silently gives the
+    child a temp dir it cannot write -- and the write carve-out is not the answer:
+    ``extra_writable_dirs`` is validated for SELF-DERIVED scratch paths only, so
+    pointing it at spec text would hand untrusted config a write window under
+    ``run``. A caller that gets True must therefore stop honoring the path, not
+    try to open it.
+
+    Both spellings are tested because the data home may be a supported symlink
+    and path-based rules see each spelling independently. Spelling is only the
+    fast answer: :func:`_identity_within_sealed_parent` then asks the filesystem
+    itself, so a case, firmlink, or normalization alias of the seal cannot walk
+    past this predicate (#9108).
+
+    A REMOTE or DEVICE spelling is refused ahead of all of that, from the raw
+    declaration, because resolving it is itself the off-host access this check
+    never meant to make (see :func:`_remote_or_device_spelling`). True is the
+    honest answer there as well as the safe one: containment cannot be
+    established locally, and every caller's response to True -- stop honoring
+    the path, fall back to a self-derived directory -- is what an unverifiable
+    declaration warrants. A local path that merely POINTS at such a location is
+    refused the same way, by the no-follow chain scan in
+    :func:`_remote_or_device_in_link_chain`, which closes the one indirection the
+    lexical test cannot see. So is a path on a mapped network drive, by
+    :func:`_remote_or_unmountable_drive_root`, which closes the spelling neither
+    of those two can see at all.
+
+    Blocking (the link-chain scan, ``realpath``, the identity walk, plus the
+    one-time priming of the runtime directories), so an async caller must reach
+    it off the event loop.
+    """
+    if not path:
+        return False
+    # BEFORE realpath and before any stat: on Windows both of those open the
+    # path, so for a remote or device spelling the check would perform the
+    # access instead of judging it.
+    if _remote_or_device_spelling(path):
+        return True
+    # The same question asked at the ROOT, for the spelling the lexical test
+    # cannot see: a mapped network drive. First of the three, because it needs no
+    # filesystem walk at all -- only the drive type, which costs nothing on the
+    # volume and so cannot be the access it is meant to prevent.
+    if _remote_or_unmountable_drive_root(path):
+        return True
+    # Same refusal, one indirection out: a local-looking declaration whose link
+    # chain ENDS on a share. Read with no-follow primitives, so the remote target
+    # is judged without being reached -- and this must precede realpath, which
+    # would follow the chain and make the connection.
+    if _remote_or_device_in_link_chain(path):
+        return True
+    # realpath resolves the ORIGINAL spelling, BEFORE any lexical pass. Order is
+    # load-bearing: normalizing first collapses ``..`` lexically and so deletes
+    # the very symlink that ``..`` was climbing out of, which is how a
+    # ``<symlink-into-run>/../tmp`` declaration read as outside the seal while the
+    # child's libc resolves symlink-first and lands back inside it (GPT review
+    # round 1). Both spellings are still checked, since path-based sandbox rules
+    # see the lexical one independently.
+    canonical = os.path.realpath(path)
+    lexical = os.path.normpath(os.path.abspath(path))
+    spellings = tuple(dict.fromkeys((lexical, canonical)))
+    parents = _voice_runtime_parent_paths()
+    for spelling in spellings:
+        for parent in parents:
+            if _path_within(spelling, parent) or _identity_within_sealed_parent(spelling, parent):
+                return True
+    return False
 
 
 _VOICE_GUARD_REMEDY = "Pick a project subdirectory that does not contain the Kiro Crew data home."

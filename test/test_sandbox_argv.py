@@ -1115,6 +1115,443 @@ class TestWritableCarveouts:
         assert approved == []
 
 
+class TestSealedRuntimeParentPredicate:
+    """#8747: the question asked BEFORE a config-declared dir reaches a child.
+
+    A spec-declared ``TMPDIR`` under ``<data home>/run`` is sealed read-only by
+    both backends, and the write carve-out above is validated for self-derived
+    scratch only — so the caller's only safe move is to stop honoring the path,
+    which it can only do if this predicate answers honestly.
+    """
+
+    def _home(self, monkeypatch, tmp_path):
+        home = tmp_path / "crew-home"
+        (home / "run").mkdir(parents=True)
+        monkeypatch.setattr(sandbox_mod, "config_dir", lambda: home)
+        return home
+
+    def test_declared_path_inside_the_run_parent_is_sealed(self, monkeypatch, tmp_path):
+        home = self._home(monkeypatch, tmp_path)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(home / "run" / "custom-tmp"))
+        # The parent itself and the managed root under it answer the same way:
+        # containment, not a leaf allowlist.
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(home / "run"))
+        assert sandbox_mod.path_within_sealed_runtime_parent(
+            str(home / "run" / "mcp-tmp" / "probe-x")
+        )
+
+    def test_path_outside_the_data_home_is_not_sealed(self, monkeypatch, tmp_path):
+        self._home(monkeypatch, tmp_path)
+        chosen = tmp_path / "operator-volume" / "tmp"
+        chosen.mkdir(parents=True)
+        assert not sandbox_mod.path_within_sealed_runtime_parent(str(chosen))
+        # An empty declaration is not a path and must not read as sealed.
+        assert not sandbox_mod.path_within_sealed_runtime_parent("")
+
+    @_POSIX_ONLY
+    def test_both_spellings_of_a_symlinked_data_home_are_sealed(self, monkeypatch, tmp_path):
+        # config_dir() deliberately preserves a supported symlinked data home,
+        # and path-based sandbox rules see each spelling independently — so a
+        # declaration written either way must be recognised.
+        real = tmp_path / "real-home"
+        (real / "run").mkdir(parents=True)
+        link = tmp_path / "linked-home"
+        link.symlink_to(real)
+        monkeypatch.setattr(sandbox_mod, "config_dir", lambda: link)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(link / "run" / "custom-tmp"))
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(real / "run" / "custom-tmp"))
+
+    @_POSIX_ONLY
+    def test_a_symlink_climbing_back_into_the_run_parent_is_sealed(self, monkeypatch, tmp_path):
+        # Resolution ORDER is the whole test. `..` must be collapsed by realpath,
+        # after symlinks, the way the child's libc will collapse it -- collapsing
+        # it lexically first deletes the very symlink it was climbing out of, so
+        # a declaration routed through a link back into the seal reads as outside.
+        home = self._home(monkeypatch, tmp_path)
+        (home / "run" / "inner").mkdir()
+        link = tmp_path / "into-run"
+        link.symlink_to(home / "run" / "inner")
+        # Lexically `<link>/../tmp` collapses to `<tmp_path>/tmp`, which is
+        # outside the seal; resolved symlink-first it is `<home>/run/tmp`.
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(link / ".." / "tmp"))
+
+    @staticmethod
+    def _install_case_insensitive_stat(monkeypatch, root: Path) -> None:
+        """Model an APFS-style case-insensitive ``stat``/``lstat`` under *root* only.
+
+        The bypass this guards (#9108) needs a filesystem that answers for a
+        differently-cased spelling, which Linux CI cannot create for real. What
+        APFS actually does is narrow: the fold lives in NAME LOOKUP, so each
+        component resolves case-insensitively for ``stat`` and ``lstat`` alike,
+        while ``realpath`` keeps the caller's spelling (it walks with
+        ``lstat``/``readlink``, neither of which rewrites a component's case) --
+        so the alias never reaches a lexical comparison in canonical form.
+        Reproduce exactly that, delegating every path outside *root* to the real
+        call so nothing else in the process is disturbed.
+        """
+        real = {"stat": os.stat, "lstat": os.lstat}
+        root_str = str(root)
+
+        def _fold(path: str) -> str | None:
+            resolved = os.path.dirname(root_str)
+            for part in os.path.relpath(path, resolved).split(os.sep):
+                try:
+                    entries = os.listdir(resolved)
+                except OSError:
+                    return None
+                match = next((e for e in entries if e.lower() == part.lower()), None)
+                if match is None:
+                    return None
+                resolved = os.path.join(resolved, match)
+            return resolved
+
+        def _folding(name: str):
+            def fake(path, *args, **kwargs):
+                try:
+                    return real[name](path, *args, **kwargs)
+                except FileNotFoundError:
+                    if not isinstance(path, (str, os.PathLike)):
+                        raise
+                    spelling = os.fspath(path)
+                    if not isinstance(spelling, str) or not spelling.startswith(root_str + os.sep):
+                        raise
+                    folded = _fold(spelling)
+                    if folded is None:
+                        raise
+                    return real[name](folded, *args, **kwargs)
+
+            return fake
+
+        monkeypatch.setattr(os, "stat", _folding("stat"))
+        monkeypatch.setattr(os, "lstat", _folding("lstat"))
+
+    def test_a_case_alias_of_the_run_parent_is_sealed(self, monkeypatch, tmp_path):
+        # #9108: on case-insensitive APFS `<data home>/RUN` and `<data home>/run`
+        # are ONE directory, and realpath does not fold the difference -- so a
+        # lexical predicate answered "not sealed" for a path the backends seal,
+        # the probe honored the declaration, and the child got a read-only TMPDIR.
+        home = self._home(monkeypatch, tmp_path)
+        (home / "run" / "custom-tmp").mkdir()
+        self._install_case_insensitive_stat(monkeypatch, tmp_path)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(home / "RUN" / "custom-tmp"))
+        # The parent's own differently-cased spelling answers the same way.
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(home / "Run"))
+
+    def test_a_missing_leaf_under_a_case_aliased_parent_is_sealed(self, monkeypatch, tmp_path):
+        # A declared temp normally does NOT exist yet, so the deepest EXISTING
+        # ancestor is what carries the identity: `<home>/RUN` folds onto the
+        # sealed parent, and nothing below a sealed directory can climb back out.
+        home = self._home(monkeypatch, tmp_path)
+        self._install_case_insensitive_stat(monkeypatch, tmp_path)
+        assert sandbox_mod.path_within_sealed_runtime_parent(
+            str(home / "RUN" / "not-created-yet" / "tmp")
+        )
+
+    def test_a_case_alias_outside_the_run_parent_is_still_not_sealed(self, monkeypatch, tmp_path):
+        # Identity is the whole test: a differently-cased path that folds onto a
+        # directory OUTSIDE the seal must stay honored, or the fix would refuse
+        # every operator-chosen temp whose spelling merely resembles the seal.
+        home = self._home(monkeypatch, tmp_path)
+        (home / "runtime-cache").mkdir()
+        self._install_case_insensitive_stat(monkeypatch, tmp_path)
+        assert not sandbox_mod.path_within_sealed_runtime_parent(
+            str(home / "RUNTIME-cache" / "tmp")
+        )
+
+    def test_a_real_case_alias_is_sealed_where_the_filesystem_folds_case(
+        self, monkeypatch, tmp_path
+    ):
+        # The same claim against the REAL filesystem, for the platforms that
+        # actually fold (APFS, NTFS). Skipped on a case-sensitive CI filesystem,
+        # where the aliased spelling is a different directory and nothing seals it.
+        home = self._home(monkeypatch, tmp_path)
+        if not (home / "RUN").is_dir():
+            pytest.skip("test filesystem is case-sensitive; no real case alias to build")
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(home / "RUN" / "custom-tmp"))
+
+    @staticmethod
+    def _trap_remote_resolution(monkeypatch) -> list[str]:
+        """Record every resolution/stat call made on a REMOTE-SHAPED spelling.
+
+        Delegates every other path to the real function on purpose: a globally
+        raising ``os.stat`` takes pytest's own machinery down with it, and the
+        claim under test is narrower anyway — not "no I/O happened" but "no I/O
+        happened ON the declared remote path".
+        """
+        touched: list[str] = []
+
+        def _looks_remote(spelling: str) -> bool:
+            return len(spelling) >= 2 and spelling[0] in "\\/" and spelling[1] in "\\/"
+
+        def _watch(real):
+            def wrapper(path, *args, **kwargs):
+                spelling = os.fspath(path) if isinstance(path, (str, os.PathLike)) else None
+                if isinstance(spelling, str) and _looks_remote(spelling):
+                    touched.append(spelling)
+                return real(path, *args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(os.path, "realpath", _watch(os.path.realpath))
+        monkeypatch.setattr(os, "stat", _watch(os.stat))
+        monkeypatch.setattr(os, "lstat", _watch(os.lstat))
+        return touched
+
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            r"\\attacker-host\share\tmp",  # UNC, backslash spelling
+            "//attacker-host/share/tmp",  # UNC, forward-slash spelling
+            r"\\?\C:\tmp",  # device namespace (long path)
+            r"\\.\PIPE\tmp",  # device namespace
+            r"\\?\UNC\attacker-host\share\tmp",  # UNC long form
+            r"\\?/UNC/attacker-host/share/tmp",  # mixed separators
+        ],
+    )
+    def test_a_remote_or_device_declaration_is_refused_without_resolving_it(
+        self, monkeypatch, tmp_path, declared
+    ):
+        # #9108 security review: the declaration is UNTRUSTED CONFIG TEXT, and on
+        # Windows `realpath` OPENS the path (GetFinalPathNameByHandle) -- so
+        # resolving a declared UNC path IS an outbound SMB connection to a host
+        # the spec author chose, made during a check whose only question was
+        # LOCAL containment (and stalling the caller for the SMB timeout when
+        # that host is dead). The predicate must answer from spelling alone.
+        self._home(monkeypatch, tmp_path)
+        touched = self._trap_remote_resolution(monkeypatch)
+        # True = "stop honoring this path", the only safe answer: local
+        # containment is unprovable for a remote/device spelling, and the caller
+        # already has a fallback -- the managed temp it allocates for an
+        # undeclared probe.
+        assert sandbox_mod.path_within_sealed_runtime_parent(declared)
+        assert touched == []
+
+    def test_a_local_declaration_is_still_resolved(self, monkeypatch, tmp_path):
+        # The refusal above is keyed to the remote/device SHAPE, not to config
+        # text in general: an ordinary absolute declaration must still be
+        # resolved and answered on its merits, or the fast rejection would refuse
+        # every operator-chosen temp.
+        self._home(monkeypatch, tmp_path)
+        chosen = tmp_path / "operator-volume" / "tmp"
+        chosen.mkdir(parents=True)
+        assert not sandbox_mod.path_within_sealed_runtime_parent(str(chosen))
+
+    @_POSIX_ONLY
+    def test_the_identity_walk_does_not_follow_a_final_symlink(self, tmp_path):
+        # The identity probe runs on paths that came from config text, so it stats
+        # NO-FOLLOW: `lstat` never traverses the final component, which is exactly
+        # where a planted link could point at a remote or stalling target and turn
+        # a local containment question into off-host I/O (#9108 security review).
+        sealed = tmp_path / "run"
+        sealed.mkdir()
+        link = tmp_path / "link-into-run"
+        link.symlink_to(sealed)
+        # The LINK's own identity is what the walk sees, never the sealed
+        # directory it points at -- so this spelling answers False here.
+        assert not sandbox_mod._identity_within_sealed_parent(str(link), str(sealed))
+
+    @_POSIX_ONLY
+    def test_a_symlink_to_the_run_parent_is_still_sealed(self, monkeypatch, tmp_path):
+        # No coverage is lost by stating no-follow: symlink resolution lives in
+        # the CANONICAL spelling, which `realpath` has already produced by the
+        # time the identity walk runs -- so a link INTO the seal is still refused.
+        home = self._home(monkeypatch, tmp_path)
+        link = tmp_path / "link-into-run"
+        link.symlink_to(home / "run")
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(link))
+
+    @staticmethod
+    def _trap_any_resolution(monkeypatch) -> list[str]:
+        """Record EVERY ``os.path.realpath`` call, whatever its argument.
+
+        The right assertion for the link-chain scan, and deliberately not the
+        shape-matching recorder above: POSIX ``realpath`` rewrites
+        ``//host/share`` to ``/host/share`` while resolving, so a recorder keyed
+        to two leading separators never fires on Linux and would pass vacuously.
+        What the scan actually promises is stronger and directly checkable --
+        the refusal is decided BEFORE any resolution runs at all.
+        """
+        calls: list[str] = []
+        real = os.path.realpath
+
+        def wrapper(path, *args, **kwargs):
+            calls.append(os.fspath(path) if isinstance(path, (str, os.PathLike)) else repr(path))
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", wrapper)
+        return calls
+
+    @_POSIX_ONLY
+    @pytest.mark.parametrize(
+        "target",
+        [
+            r"\\attacker-host\share\tmp",  # UNC, backslash spelling
+            "//attacker-host/share/tmp",  # UNC, forward-slash spelling
+            r"\\?\UNC\attacker-host\share\tmp",  # UNC long form
+            r"\\.\PIPE\tmp",  # device namespace
+        ],
+    )
+    def test_a_local_symlink_to_a_remote_target_is_refused_without_resolving_it(
+        self, monkeypatch, tmp_path, target
+    ):
+        # One indirection past the lexical refusal: the DECLARATION is an ordinary
+        # local path, so it clears `_remote_or_device_spelling`, but the link it
+        # names points at a share. `realpath` follows that link, so on Windows the
+        # SMB connection happens inside the containment check exactly as it would
+        # for a declared UNC path -- the lexical guard just never saw it.
+        self._home(monkeypatch, tmp_path)
+        link = tmp_path / "local-looking-link"
+        link.symlink_to(target)
+        resolutions = self._trap_any_resolution(monkeypatch)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(link))
+        assert resolutions == []
+
+    @_POSIX_ONLY
+    def test_a_remote_target_deeper_in_the_link_chain_is_refused(self, monkeypatch, tmp_path):
+        # Chasing is what makes the check correct rather than cosmetic: testing
+        # only the declared path's own components would clear `hop-1`, whose
+        # target is local, and then hand `realpath` a chain that ends on a share.
+        self._home(monkeypatch, tmp_path)
+        far = tmp_path / "hop-2"
+        far.symlink_to(r"\\attacker-host\share\tmp")
+        near = tmp_path / "hop-1"
+        near.symlink_to(far)
+        resolutions = self._trap_any_resolution(monkeypatch)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(near))
+        assert resolutions == []
+
+    @_POSIX_ONLY
+    def test_a_remote_target_on_an_ancestor_component_is_refused(self, monkeypatch, tmp_path):
+        # The link need not be the leaf. A declared temp usually does not exist
+        # yet, so the component that carries the redirection is typically an
+        # ANCESTOR of it -- and `realpath` follows that one just the same.
+        self._home(monkeypatch, tmp_path)
+        link = tmp_path / "parent-link"
+        link.symlink_to("//attacker-host/share")
+        resolutions = self._trap_any_resolution(monkeypatch)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(link / "not-created-yet" / "tmp"))
+        assert resolutions == []
+
+    @_POSIX_ONLY
+    def test_a_benign_local_symlink_chain_still_resolves(self, monkeypatch, tmp_path):
+        # The negative control the chase must not cost: a multi-hop LOCAL chain
+        # ending outside the seal stays honored, and the same chain ending inside
+        # it is still refused on the merits rather than by the remote guard.
+        home = self._home(monkeypatch, tmp_path)
+        outside = tmp_path / "operator-volume" / "tmp"
+        outside.mkdir(parents=True)
+        (tmp_path / "b-out").symlink_to(outside)
+        (tmp_path / "a-out").symlink_to(tmp_path / "b-out")
+        assert not sandbox_mod.path_within_sealed_runtime_parent(str(tmp_path / "a-out"))
+        (tmp_path / "b-in").symlink_to(home / "run" / "custom-tmp")
+        (tmp_path / "a-in").symlink_to(tmp_path / "b-in")
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(tmp_path / "a-in"))
+
+    @_POSIX_ONLY
+    def test_a_symlink_cycle_is_refused_instead_of_looping(self, monkeypatch, tmp_path):
+        # ELOOP guard. The chase reads links itself, so it does not inherit the
+        # kernel's loop detection and must carry its own hop cap -- and the
+        # bounded answer for a path whose canonical form cannot be established
+        # is a refusal, matching every other unverifiable declaration here.
+        self._home(monkeypatch, tmp_path)
+        first = tmp_path / "loop-a"
+        second = tmp_path / "loop-b"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        assert sandbox_mod.path_within_sealed_runtime_parent(str(first))
+
+    @staticmethod
+    def _fake_drive_probe(monkeypatch, verdicts: dict[str, bool | None]) -> list[str]:
+        """Substitute the Windows drive-type probe, and record every root it sees.
+
+        The probe is the module's platform seam: the real one calls
+        ``GetDriveTypeW`` and answers ``None`` off Windows, so replacing it is
+        what lets the CLASSIFICATION logic -- root derivation, the refusal, the
+        fail-closed default -- run on Linux CI. The ctypes call itself stays
+        Windows-only and is not exercised here.
+        """
+        seen: list[str] = []
+
+        def probe(root: str) -> bool | None:
+            seen.append(root)
+            if root not in verdicts:
+                # Loud rather than a silent no-op: an unlisted root returning
+                # None would look like the off-Windows answer and quietly pass.
+                raise AssertionError(f"drive probe asked about an unexpected root: {root!r}")
+            return verdicts[root]
+
+        monkeypatch.setattr(sandbox_mod, "_windows_drive_is_local", probe)
+        return seen
+
+    def test_a_temp_on_a_mapped_remote_drive_is_refused_without_resolving_it(
+        self, monkeypatch, tmp_path
+    ):
+        # The residual disclosed to reviewers, now closed. `Z:\tmp` has no
+        # two-leading-separator prefix, so the lexical guard clears it, and if it
+        # is not a link the chain scan finds nothing to judge -- yet the volume is
+        # a share, so `realpath` opens it and the SMB round-trip happens anyway.
+        # A mapped drive is the COMMON enterprise shape of the same exposure, and
+        # no amount of string matching separates `Z:` from a local disk: the OS
+        # has to be asked, from the ROOT, which touches no file on the volume.
+        self._home(monkeypatch, tmp_path)
+        seen = self._fake_drive_probe(monkeypatch, {"Z:\\": False})
+        resolutions = self._trap_any_resolution(monkeypatch)
+        assert sandbox_mod.path_within_sealed_runtime_parent(r"Z:\tmp")
+        assert seen == ["Z:\\"]
+        assert resolutions == []
+
+    def test_a_temp_on_a_local_drive_is_still_resolved(self, monkeypatch, tmp_path):
+        # The control that keeps the refusal from swallowing every Windows path:
+        # a drive the probe reports as local is judged on its merits, which means
+        # resolution DOES run for it.
+        self._home(monkeypatch, tmp_path)
+        seen = self._fake_drive_probe(monkeypatch, {"C:\\": True})
+        resolutions = self._trap_any_resolution(monkeypatch)
+        assert not sandbox_mod.path_within_sealed_runtime_parent(r"C:\operator\tmp")
+        assert seen == ["C:\\"]
+        assert resolutions != []
+
+    def test_an_unclassifiable_drive_root_is_refused(self, monkeypatch, tmp_path):
+        # DRIVE_NO_ROOT_DIR and DRIVE_UNKNOWN both land here, reported as
+        # not-local rather than as a separate verdict: `volume_is_local`
+        # allowlists the local drive kinds, so anything it cannot vouch for is
+        # already False. A root the OS cannot mount or cannot classify has
+        # cleared nothing and certainly is not the sealed parent, so the
+        # fail-closed answer is a refusal.
+        #
+        # The two sentinels are deliberately NOT interchangeable: False means the
+        # probe classified the volume and it is not local, while None means there
+        # was no volume to classify at all (off Windows). Only the second is a
+        # no-op -- see test_the_real_drive_probe_is_a_noop_off_windows.
+        self._home(monkeypatch, tmp_path)
+        seen = self._fake_drive_probe(monkeypatch, {"Q:\\": False})
+        resolutions = self._trap_any_resolution(monkeypatch)
+        assert sandbox_mod.path_within_sealed_runtime_parent(r"Q:\tmp")
+        assert seen == ["Q:\\"]
+        assert resolutions == []
+
+    def test_a_driveless_posix_declaration_never_consults_the_drive_probe(
+        self, monkeypatch, tmp_path
+    ):
+        # On POSIX the classification is a no-op, and it must not even be reached:
+        # an ordinary absolute path carries no drive component to classify, so the
+        # guard falls straight through to the containment question.
+        self._home(monkeypatch, tmp_path)
+        chosen = tmp_path / "operator-volume" / "tmp"
+        chosen.mkdir(parents=True)
+        seen = self._fake_drive_probe(monkeypatch, {})
+        assert not sandbox_mod.path_within_sealed_runtime_parent(str(chosen))
+        assert seen == []
+
+    @_POSIX_ONLY
+    def test_the_real_drive_probe_is_a_noop_off_windows(self):
+        # The platform gate itself, unpatched: off Windows there is no volume to
+        # classify, the probe answers None, and the guard treats that as "nothing
+        # to refuse" rather than as an unclassifiable root.
+        assert sandbox_mod._windows_drive_is_local("Z:\\") is None
+        assert not sandbox_mod._remote_or_unmountable_drive_root(r"Z:\tmp")
+
+
 class TestBuildLauncherScript:
     @_POSIX_ONLY
     def test_strict_script_contains_dirs(self):

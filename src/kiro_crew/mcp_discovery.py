@@ -48,6 +48,7 @@ from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_ser
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
+    path_within_sealed_runtime_parent,
     sandboxed_spawn_argv,
     sandboxed_spawn_argv_async,
 )
@@ -1824,6 +1825,29 @@ async def _read_stdio_jsonrpc_response(
             return parsed
 
 
+#: Temp keys a child's ``tempfile``/``mktemp`` consults, in POSIX-then-Windows
+#: order. Matched case-INSENSITIVELY wherever a spec supplies one: Windows env
+#: keys are case-insensitive and the sanitized spec preserves the author's
+#: spelling.
+_CANONICAL_TEMP_KEYS = ("TMPDIR", "TMP", "TEMP")
+
+
+def _sealed_declared_temp_keys(env: dict[str, str]) -> dict[str, str]:
+    """Spec-declared temp keys whose value the sandbox seals read-only (#8747).
+
+    Returns the offending keys (upper-cased) mapped to the declared path, so a
+    caller can name both in its diagnostic. Blocking path resolution, so an
+    async caller must reach it off the event loop.
+    """
+    sealed: dict[str, str] = {}
+    for key, value in env.items():
+        if key.upper() not in _CANONICAL_TEMP_KEYS or not isinstance(value, str):
+            continue
+        if path_within_sealed_runtime_parent(value):
+            sealed[key.upper()] = value
+    return sealed
+
+
 async def probe_server(
     server: McpServerInfo, *, client_info: dict[str, str] | None = None
 ) -> McpServerInfo:
@@ -1974,8 +1998,43 @@ async def probe_server(
         # case-insensitively (Windows env keys are case-insensitive and the
         # sanitized spec preserves the author's spelling).
         _declared_temp_upper = {
-            key.upper() for key in (server.env or {}) if key.upper() in ("TMPDIR", "TMP", "TEMP")
+            key.upper() for key in (server.env or {}) if key.upper() in _CANONICAL_TEMP_KEYS
         }
+        # The spec's OWN spellings, kept beside the upper-cased set: the rewrite
+        # below has to tell the declaration apart from the ambient key of the
+        # same name, and only the exact spelling does that (#9108 security
+        # review -- comparing upper-cased names alone let BOTH survive).
+        _declared_temp_spelled = {
+            key for key in (server.env or {}) if key.upper() in _CANONICAL_TEMP_KEYS
+        }
+        # ...but a declaration that lands inside the sealed runtime parent is
+        # REFUSED rather than honored (#8747). Both backends seal
+        # ``<data home>/run`` read-only, so honoring it hands the child a temp
+        # dir it cannot write -- the same Bun/Koffi extraction failure #8653
+        # fixed for the managed path, and silent because the probe still reports
+        # a green handshake for servers that never touch temp. Carving the
+        # declared path out of the seal is NOT the alternative: spec ``env`` is
+        # untrusted config text and ``extra_writable_dirs`` is validated for
+        # self-derived scratch only. The managed temp takes over instead, which
+        # keeps the operator's storage intent -- their path named the data-home
+        # volume, and so does the managed root. Refused as a WHOLE: ``tempfile``
+        # consults TMPDIR before TMP, so honoring a surviving sibling key would
+        # leave writability depending on which key the spec happened to spell.
+        _sealed_temp: dict[str, str] = {}
+        if _declared_temp_upper:
+            try:
+                _sealed_temp = await asyncio.to_thread(_sealed_declared_temp_keys, server.env or {})
+            except Exception:
+                logger.debug("sealed declared-temp check unavailable", exc_info=True)
+            if _sealed_temp:
+                logger.warning(
+                    "MCP probe [%s]: ignoring spec-declared %s — it is inside the "
+                    "sandbox-sealed runtime parent, where the probed server cannot "
+                    "write; probing with the managed temp instead",
+                    server.name,
+                    ", ".join(f"{key}={path}" for key, path in sorted(_sealed_temp.items())),
+                )
+                _declared_temp_upper = set()
         probe_scratch: "Path | None" = None
         if not _declared_temp_upper:
             try:
@@ -2019,17 +2078,45 @@ async def probe_server(
 
                 # Merged AFTER the wrap so the managed triple lands on the
                 # SCRUBBED env the child actually receives.
+                #
+                # Every OTHER spelling of a temp key is dropped first, not just
+                # the three canonical names: spec env keys are matched
+                # case-insensitively here, so a declaration spelled ``tmpdir``
+                # would otherwise stay in the env beside the managed ``TMPDIR``.
+                # On Windows those two names are ONE variable, which is how a
+                # case variant survived the refusal above and handed the child
+                # back the sealed path this branch exists to withhold (#9108
+                # security review).
+                env = {
+                    key: value
+                    for key, value in env.items()
+                    if key.upper() not in _CANONICAL_TEMP_KEYS
+                }
                 env = {**env, **tmp_env(probe_scratch)}
             elif _declared_temp_upper:
                 # Yielding alone is not enough: ambient temp keys are still in
                 # ``env`` and ``tempfile`` consults TMPDIR before TMP, so a
                 # spec declaring only TMP would silently write through the
-                # inherited ambient TMPDIR. Strip the canonical keys the spec
-                # did NOT declare (mirrors the backend chokepoint).
+                # inherited ambient TMPDIR. Strip every canonical key the spec
+                # did NOT itself spell (mirrors the backend chokepoint) --
+                # matched case-insensitively, so an ambient ``TMPDIR`` cannot
+                # outrank a declared ``tmpdir`` in the child's lookup while both
+                # sit in the env.
                 env = {
                     key: value
                     for key, value in env.items()
-                    if not (key in ("TMPDIR", "TMP", "TEMP") and key not in _declared_temp_upper)
+                    if key.upper() not in _CANONICAL_TEMP_KEYS or key in _declared_temp_spelled
+                }
+            elif _sealed_temp:
+                # The refusal above stands even though allocation failed, so
+                # there is no managed dir to point at: strip every temp key so
+                # the child falls back to the ambient temp instead of the sealed
+                # path it cannot write. Fail-open on containment, never onto a
+                # directory already known to be read-only.
+                env = {
+                    key: value
+                    for key, value in env.items()
+                    if key.upper() not in _CANONICAL_TEMP_KEYS
                 }
         except Exception:
             logger.debug("probe temp containment unavailable", exc_info=True)
