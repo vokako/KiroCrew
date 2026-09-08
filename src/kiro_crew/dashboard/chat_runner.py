@@ -343,8 +343,8 @@ def _empty_auto_continue_enabled() -> bool:
 # opening delimiter and the injected content. One sentence, imperative, because
 # it is re-sent on every turn that drains context: it must be cheap and it must
 # be unambiguous. "Respond only to the user's visible message" is what makes
-# the feature-request seed start the guided flow instead of being recited
-# (#4780); "never quote, echo, or reveal" is what keeps internal operator
+# the feature-request seed start the guided flow instead of being recited;
+# "never quote, echo, or reveal" is what keeps internal operator
 # instructions out of the visible transcript for every other producer too.
 # Best-effort model compliance, NOT a confidentiality boundary: a model can
 # ignore it, so pending-context payloads must never carry secrets or content
@@ -369,7 +369,7 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     frame never told the model that: on a fresh session whose visible message
     is one short line, the agent recited the injected feature-request workflow
     verbatim as its reply — surfacing internal instructions in the transcript
-    on every click of the header button (#4780). The contract is part of the
+    on every click of the header button. The contract is part of the
     frame, not any producer's payload, so every producer (app-kit context
     inject, artifact companion, Slack thread backfill, feature-request seed)
     is covered without each having to remember to say "don't echo this".
@@ -1051,7 +1051,7 @@ def _pinned_model_verdict(client: Any, model: str, provider: str) -> bool | None
 
     ``True`` withheld, ``False`` runnable, ``None`` **unknown**. The third state
     is the reason this exists as its own function: the verdict is carried in the
-    slots payload (#1819) so the composer stops re-deriving "usable?" from
+    slots payload so the composer stops re-deriving "usable?" from
     picker-list membership, and a consumer must be able to tell "the account
     cannot run this" from "nothing has told us yet". Every fail-open branch
     below is a genuine unknown, not a runnable answer:
@@ -1082,7 +1082,7 @@ def _pinned_model_verdict(client: Any, model: str, provider: str) -> bool | None
 
     A pin can carry a stale ``<namespace>::<bare-id>`` qualifier from the
     catalog that advertised it when it was stored, while the session being
-    judged advertises the BARE id (#8521) -- the same class of namespace
+    judged advertises the BARE id -- the same class of namespace
     mismatch the ``claude_code`` exemption above acknowledges, except here the
     two spellings ARE comparable once the qualifier is peeled. So a literal
     miss is retried through :func:`resolve_pin_spelling` (full id first, then
@@ -1757,8 +1757,8 @@ _RE_TRAILING_REQUEST_ID = re.compile(r"\(request_id:\s*[0-9a-fA-F-]+\)\s*$")
 # of the same action, so re-prompting for each is nagging. The flag used to be
 # cleared only in the turn runner's ``finally``, which made its lifetime the
 # whole TURN — so a call the model issued LATER in that turn, after taking the
-# denial as feedback and revising, was auto-denied without ever being shown
-# (issue #7681). That silently broke deny -> discuss -> revise -> retry.
+# denial as feedback and revising, was auto-denied without ever being shown,
+# silently breaking deny -> discuss -> revise -> retry.
 #
 # Model-authored output is the boundary: a group's text/reasoning is streamed
 # BEFORE its tool_use blocks, so neither of these events ever falls between two
@@ -3129,7 +3129,7 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     # rather than the neutral ``display_safe``, because it is context-aware and the
     # shared sink's default pair would silently drop that.
     #
-    # Strip trailing control-tag lines FIRST (#7948): this leg mirrors a
+    # Strip trailing control-tag lines FIRST: this leg mirrors a
     # dashboard turn — a marker-taught session — to a channel whose client
     # renders HTML comments literally. Strip-then-redact matches display_safe.
     text, _ = redact_for_display(strip_control_comments(assistant_text), redact_via_context)
