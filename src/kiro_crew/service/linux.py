@@ -505,7 +505,17 @@ def _seed_env_file() -> None:
         # root-only directory); leave whatever is there untouched.
         if _sudo_run("test", "-e", str(ENV_FILE_PATH)).returncode == 0:
             return
-        _sudo_run("mkdir", "-p", str(ENV_DIR))
+        # Explicit mode, not the umask's: ``mkdir -p`` under sudo inherits the union
+        # of sudo's umask and the invoking user's, so a CIS-hardened image (umask 027
+        # or 077) produced a ``0750`` / ``0700`` root-owned directory that the
+        # non-root gateway could not search. Every path resolved beneath a directory
+        # like that answers EACCES rather than ENOENT for a file that is not there,
+        # which is the one shape a fail-closed reader cannot tell from "present but
+        # unreadable". The managed governance tier now lives in its own sibling
+        # directory (``platform.governance._MANAGED_POLICY_LINUX``), so nothing reads
+        # under here fail-closed any more; the explicit mode keeps the next reader
+        # from meeting the same surprise.
+        _sudo_run("install", "-d", "-m", "0755", str(ENV_DIR))
         # 0644: readable so an operator can inspect it, root-owned so an
         # unprivileged process cannot rewrite the service's environment.
         _install_file_via_sudo(_ENV_FILE_TEMPLATE, ENV_FILE_PATH, mode="0644")

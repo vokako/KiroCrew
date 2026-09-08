@@ -34,6 +34,7 @@ See ``docs/system-specs/modules/platform-context.md`` (Plugin admission).
 
 from __future__ import annotations
 
+import base64
 import fnmatch
 import hashlib
 import hmac
@@ -137,13 +138,89 @@ def canonical_signing_bytes(body: Mapping[str, object]) -> bytes:
 def hmac_signature(secret: str, payload: bytes) -> str:
     """Compute the expected HMAC-SHA256 hex digest over *payload*.
 
-    POC symmetric primitive shared by the plugin-manifest and security-policy
-    checks.  A production implementation swaps this for an asymmetric verify
-    against a publisher/issuer public key pinned in the policy; the shape (the
-    trust root holds the key, the signed document holds only the signature) is
-    unchanged, which is why both call sites route through one helper.
+    LEGACY symmetric primitive, kept so every fleet that already signs with a
+    shared secret keeps verifying byte-for-byte.  It is **not** an authenticity
+    proof against an insider: the verifier holds the same secret the signer does,
+    so anyone who can read ``trust_keys`` can mint a document that verifies.  New
+    fleets use ``trust_public_keys`` (:func:`ed25519_verify`), where the trust
+    root holds only the PUBLIC half and re-signing requires the private half,
+    which never sits on the managed host.
     """
     return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def ed25519_verify(public_key: str, payload: bytes, signature: str) -> bool:
+    """True when *signature* is a valid Ed25519 signature over *payload*.
+
+    Asymmetric counterpart to :func:`hmac_signature`, and the whole reason it
+    exists: the trust root holds the verifying half while the signing half stays
+    off the managed host, so reading the trust root does not confer the ability
+    to forge a ceiling.
+
+    *public_key* and *signature* are base64 (standard alphabet, padding optional)
+    — what an operator can paste into JSON and what the runbook's
+    ``openssl … | base64`` emits.  One encoding on purpose; see
+    :func:`_decode_key_material`.
+
+    Never raises.  A malformed key, malformed signature, wrong length or failed
+    check is one ``False``, because the caller's only safe reading of "could not
+    prove it" is "not proven" — and an exception escaping here would leave
+    ``load_security_policy`` raising something other than
+    ``PlatformCompositionError``, which the boot handler does not treat as fatal,
+    degrading the host to UNGOVERNED and inverting the flag that demanded the
+    signature in the first place.
+    """
+    try:
+        # Function-local on purpose: this is the availability probe. Hoisting it would
+        # make a missing or broken ``cryptography`` an ImportError at module load, which
+        # takes down the admission trust root instead of degrading one verification to
+        # "unproven" as the ``except`` below documents.
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except Exception:  # pragma: no cover - core dependency; defensive only
+        logger.warning(
+            "cryptography is unavailable, so no asymmetric policy signature can be "
+            "verified; treating the document as unproven"
+        )
+        return False
+    key_bytes = _decode_key_material(public_key)
+    sig_bytes = _decode_key_material(signature)
+    if key_bytes is None or sig_bytes is None:
+        return False
+    # Length-check before the primitive so a truncated paste reads as a plain
+    # False rather than a ValueError surfacing from the backend.
+    if len(key_bytes) != 32 or len(sig_bytes) != 64:
+        return False
+    try:
+        Ed25519PublicKey.from_public_bytes(key_bytes).verify(sig_bytes, payload)
+    except InvalidSignature:
+        return False
+    except Exception:
+        logger.debug("asymmetric signature verification could not run", exc_info=True)
+        return False
+    return True
+
+
+def _decode_key_material(raw: str) -> Optional[bytes]:
+    """Decode base64 (padded or not) key/signature text.  ``None`` on junk.
+
+    Padding is re-added rather than required because a 32-byte key base64-encodes
+    to 44 characters ending in ``=`` and operators routinely paste it stripped.
+
+    ONE encoding on purpose. An earlier revision also accepted hex, which made a
+    64-character hex key ambiguous with base64 (any hex string whose length is a
+    multiple of 4 is also valid base64) and forced a try-hex-first ordering rule the
+    format would have to carry forever. The shipped runbook emits base64
+    (``openssl … | base64``), no in-repo tooling emits hex, so the ambiguity was
+    bought for a convenience nothing used.
+    """
+    text = "".join(str(raw).split())
+    if not text:
+        return None
+    try:
+        return base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+    except Exception:
+        return None
 
 
 def _normalize_name(name: str) -> str:
@@ -194,6 +271,45 @@ class PluginManifest:
         return canonical_signing_bytes(body)
 
 
+#: Marks a key that is ABSENT from the document, as opposed to present with the
+#: value ``null``. ``dict.get(key)`` collapses the two into ``None``, and for a
+#: security requirement they mean different things: absent is the documented
+#: default, ``null`` is an authoring error that must take the fail-closed direction.
+_MISSING: object = object()
+
+
+def _coerce_flag(raw: object, key: str) -> bool:
+    """Read a strict JSON boolean GATE flag.  A non-boolean is an authoring error.
+
+    ``bool()`` on a JSON string is the trap: ``bool("false")`` is ``True`` and
+    ``bool("")`` is ``False``, so a string never means what the author wrote.  Refusing
+    to guess and warning loudly follows the same rule ``_coerce_trust_keys`` applies to
+    a malformed key: a value that is not of the declared type is not coerced.
+
+    An ABSENT key reads ``False`` -- the documented default for every flag this reads.
+    Callers pass ``d.get(key, _MISSING)`` so absence is distinguishable from an explicit
+    JSON ``null``, which a fleet template renders for an unset variable and which reads
+    here as MALFORMED, not absent.  A present-but-not-boolean value (``null`` included)
+    reads ``True``, the closed direction: a fleet that wrote ``"require_signature":
+    "true"`` meant to turn the gate ON, and reading that as OFF admits an unsigned
+    plugin -- the gate failing open on a typo.  Reading it as ON at worst refuses a
+    policy the fleet then fixes, which is the loud failure.  Both flags this reads are
+    gates, so both directions are fixed here rather than parameters: an earlier
+    revision exposed them for a flag that was not a gate, and that flag is gone.
+    """
+    if raw is _MISSING:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    logger.warning(
+        "admission policy %r is %s, not a boolean; treating it as True (write true or "
+        "false, unquoted)",
+        key,
+        type(raw).__name__,
+    )
+    return True
+
+
 def _coerce_trust_keys(raw: object) -> Dict[str, str]:
     """Keep only usable secrets: a non-empty ``str`` value per issuer/publisher.
 
@@ -241,6 +357,18 @@ class AdmissionPolicy:
     # ``publisher``, a security policy by its ``identity.issuer``, so an operator
     # maintains ONE key store rather than two.
     trust_keys: Dict[str, str] = field(default_factory=dict)
+    # SECURITY-POLICY ISSUER -> base64 Ed25519 PUBLIC key.  Checked BEFORE
+    # ``trust_keys`` so a fleet migrating to asymmetric signing can carry both during the
+    # rollout and have the strong proof win per issuer.  Public by construction, so unlike
+    # ``trust_keys`` this map leaks no signing power.
+    #
+    # Policy issuers ONLY -- deliberately not "issuer/publisher".  Plugin manifest
+    # verification reads ``trust_keys`` alone (``_signature_valid``), so a publisher
+    # configured only here has no symmetric secret and its plugin is REFUSED.  The
+    # asymmetric path for plugin manifests is not implemented, and describing this map as
+    # covering publishers advertised a verification that does not exist -- an operator
+    # following it would move a publisher's key here and find the plugin rejected.
+    trust_public_keys: Dict[str, str] = field(default_factory=dict)
     # Marketplace allowlist. None = no allowlist (any non-banned plugin). A
     # present (even empty) list = only these names are admitted.
     approved: Optional[List[str]] = None
@@ -267,14 +395,21 @@ class AdmissionPolicy:
         approved = d.get("approved", None)
         return AdmissionPolicy(
             mode=str(d.get("mode", MODE_OPEN)),
-            require_signature=bool(d.get("require_signature", False)),
-            require_policy_signature=bool(d.get("require_policy_signature", False)),
+            # ``_MISSING`` rather than the ``.get`` default of None: an explicit
+            # ``"require_signature": null`` is a present-but-not-boolean value and
+            # takes the fail-closed direction like any other malformed gate flag.
+            require_signature=_coerce_flag(
+                d.get("require_signature", _MISSING), "require_signature"
+            ),
+            require_policy_signature=_coerce_flag(
+                d.get("require_policy_signature", _MISSING), "require_policy_signature"
+            ),
             trust_keys=_coerce_trust_keys(d.get("trust_keys")),
+            trust_public_keys=_coerce_trust_keys(d.get("trust_public_keys")),
             approved=(_coerce_str_list(approved) if approved is not None else None),
             banned=_coerce_str_list(d.get("banned", [])),
             capability_ceiling={
-                str(k): _coerce_str_list(v)
-                for k, v in (d.get("capability_ceiling") or {}).items()
+                str(k): _coerce_str_list(v) for k, v in (d.get("capability_ceiling") or {}).items()
             },
         )
 
@@ -311,7 +446,9 @@ _DEFAULT_POLICY_BODY: Dict[str, object] = {
         "and the dashboard governance indicator shows Disabled. To restrict "
         "admission, set mode='enforce' and populate 'approved' / 'require_signature'. "
         "'require_policy_signature' additionally demands a VERIFIED signature on "
-        "security_policy.json, keyed by its identity.issuer in 'trust_keys'."
+        "security_policy.json, keyed by its identity.issuer in 'trust_public_keys' "
+        "(Ed25519, recommended) or the legacy symmetric 'trust_keys'. To stop "
+        "accepting symmetric proofs, remove the issuer from 'trust_keys'."
     ),
 }
 
@@ -364,9 +501,7 @@ def seed_default_policy() -> bool:
             )
             wrote = True
         seed_marker.parent.mkdir(parents=True, exist_ok=True)
-        seed_marker.write_text(
-            datetime.now(tz=timezone.utc).isoformat() + "\n", encoding="utf-8"
-        )
+        seed_marker.write_text(datetime.now(tz=timezone.utc).isoformat() + "\n", encoding="utf-8")
         return wrote
     except Exception:
         logger.warning("first-run: admission policy seed failed", exc_info=True)
@@ -621,7 +756,15 @@ def _signature_valid(manifest: PluginManifest, policy: AdmissionPolicy) -> bool:
     if not secret:
         return False
     expected = hmac_signature(secret, manifest.signing_payload())
-    return hmac.compare_digest(expected, manifest.signature)
+    # Compare BYTES, not str.  ``hmac.compare_digest`` raises ``TypeError`` on a
+    # ``str`` holding any non-ASCII character, and ``manifest.signature`` is text the
+    # PLUGIN wrote.  A raised ``TypeError`` here is not a denial: it escapes
+    # ``evaluate_admission`` as a plain (non-``PlatformCompositionError``)
+    # exception, which the CLI boot handler logs and steps past, so the process
+    # would come up with no companion context -- no fleet overlay -- on the very
+    # input the gate exists to refuse.  Encoding both sides keeps every malformed
+    # signature an ordinary ``False`` (same rule as ``verify_policy_signature``).
+    return hmac.compare_digest(expected.encode("utf-8"), str(manifest.signature).encode("utf-8"))
 
 
 def _capabilities_within_ceiling(

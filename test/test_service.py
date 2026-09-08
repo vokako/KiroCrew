@@ -541,7 +541,10 @@ class TestLinuxEnvironmentFile:
 
         # _seed_env_file probes existence via `_sudo_run("test", "-e", path)`;
         # answer it from the real tmp file so the create-if-absent logic runs.
+        sudo_calls: list[tuple[str, ...]] = []
+
         def _fake_sudo(*args, **_k):
+            sudo_calls.append(tuple(args))
             if args and args[0] == "test":
                 rc = 0 if Path(args[-1]).exists() else 1
                 return MagicMock(returncode=rc, stdout="", stderr="")
@@ -554,6 +557,13 @@ class TestLinuxEnvironmentFile:
         assert env_file.exists()
         # Seed is inert until an operator opts in: the port line is commented.
         assert "#KIROCREW_PORT=" in written["contents"]
+        # The directory is created with an EXPLICIT world-searchable mode rather than
+        # whatever the invoking user's umask leaves: under a hardened umask a bare
+        # ``mkdir -p`` produced a 0750/0700 root-owned dir that the non-root gateway
+        # could not search, so a file that was not there answered EACCES instead of
+        # ENOENT to every fail-closed reader beneath it.
+        assert ("install", "-d", "-m", "0755", str(env_file.parent)) in sudo_calls
+        assert not any(c[:1] == ("mkdir",) for c in sudo_calls)
 
     def test_seed_env_file_never_clobbers_operator_edits(self, tmp_path, monkeypatch):
         from kiro_crew.service import linux as svc_linux

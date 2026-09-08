@@ -30,21 +30,28 @@ refresh interval changed without editing a signed document.
 Precedence, and why this tier sits where it does
 ------------------------------------------------
 
-``load_security_policy`` resolves, first present winning:
+``load_security_policy`` resolves, highest first.  The top two tiers are
+AUTHORITIES; every tier below one of them may only **tighten** it:
 
-1. ``KIROCREW_SECURITY_POLICY`` — an explicit LOCAL file.
+1. the **MDM-managed configuration profile** — root-owned, re-asserted by the
+   device management system on every check-in.
 2. **this tier** — the centrally-distributed document.
-3. the companion-bundled resource.
-4. ``<data-home>/security_policy.json``.
-5. none → ungoverned.
+3. ``KIROCREW_SECURITY_POLICY`` — an explicit LOCAL file.
+4. the companion-bundled resource.
+5. ``<data-home>/security_policy.json``.
+6. none → ungoverned.
 
-Tier 1 stays above this one because it is the **rollback lever**.  A bad central
-push is the failure mode with the widest blast radius in the whole model — one
-document, every host — and an operator recovering from it needs a channel that
-outranks the thing that broke, reachable without waiting for the endpoint to be
-fixed.  Tiers 3 and 4 sit below because they are what the fetched document is
-*replacing*; a fleet that ships a bootstrap policy naming a source expects the
-source to win, or the bootstrap could never be superseded.
+Tiers 3–5 are mutually exclusive (first present wins among them) and collectively
+form the *subordinate*, which intersects into the authority above it.  So this tier
+now outranks ``KIROCREW_SECURITY_POLICY``, which it did not use to: while the env
+file sat above the fetched document the enterprise ceiling was advisory — any
+account that can set an environment variable could point it at a permissive file and
+the fleet's ceiling never bound.  Tiers 4 and 5 sit below for the older reason,
+unchanged: they are what the fetched document is *replacing*, and a fleet that ships
+a bootstrap policy naming a source expects the source to win, or the bootstrap could
+never be superseded.
+
+
 
 Availability, and the one thing this must never do
 --------------------------------------------------
@@ -489,8 +496,8 @@ def _fetch_file(request: FetchRequest) -> FetchedPolicy:
     read-only file. The field manual already tells
     operators to distribute to a "read-only, root-owned path"; this makes that a
     precondition instead of advice. An operator who genuinely wants a local, editable
-    policy file has the channel designed for it — ``KIROCREW_SECURITY_POLICY``, tier 1,
-    which is read once at boot and outranks this tier anyway.
+    policy file has the channel designed for it — ``KIROCREW_SECURITY_POLICY``, which is
+    read once at boot and TIGHTENS this tier.
 
     **Opened ONCE, and the validator is a DIGEST of the bytes read.**  Stat-then-read is
     two trips to a path an administrator (or anything sharing the mount) can replace in
@@ -530,8 +537,8 @@ def _fetch_file(request: FetchRequest) -> FetchedPolicy:
                 "as. A file:// distribution source must be read-only to it, or an agent "
                 "subprocess could publish its own ceiling. Use a root-owned path or a "
                 "read-only mount; for a local, editable policy use "
-                "KIROCREW_SECURITY_POLICY instead — that is the channel designed for it, "
-                "and it outranks this tier anyway."
+                "KIROCREW_SECURITY_POLICY instead — that is the channel designed for "
+                "it; it tightens this tier."
             )
         with os.fdopen(fd, "rb", closefd=False) as handle:
             body = handle.read(MAX_POLICY_BYTES + 1)
@@ -640,6 +647,30 @@ def request_headers() -> Dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+def _audit_managed_override_ignored(names: "list[str]") -> None:
+    """Best-effort audit that a managed-source override was refused.  Never raises."""
+    try:
+        # Function-local by necessity, not style: ``kiro_crew.sel`` imports
+        # ``platform.governance`` at module level, and ``governance`` imports this
+        # module, so a top-level import here is a cycle. Same reason
+        # ``_audit_refresh`` defers the same two names.
+        from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
+        from kiro_crew.sel import sel
+
+        sel().log_governance_decision(
+            scope="distribution",
+            item=",".join(names),
+            outcome="denied",
+            rule="managed-source-pinned",
+            layer="policy",
+            reason="the managed tier declares the central distribution",
+            session_key=HOST_SESSION_KEY,
+            tool_name="policy_distribution",
+        )
+    except Exception:
+        logger.debug("could not audit the ignored managed-source override", exc_info=True)
+
+
 def resolve_distribution(declared: Optional[PolicyDistribution] = None) -> PolicyDistribution:
     """The effective distribution settings: the env channel over *declared*.
 
@@ -648,6 +679,56 @@ def resolve_distribution(declared: Optional[PolicyDistribution] = None) -> Polic
     without editing (and re-signing) the published document.
     """
     base = declared or PolicyDistribution()
+
+    if base.managed:
+        # The MANAGED tier declared this source, so the environment does not get a
+        # vote. Honouring KIROCREW_POLICY_URL here would let any account that can set
+        # a variable choose which document becomes the fleet ceiling -- the exact
+        # redirection the managed tier exists to prevent, and enough to strip every
+        # centrally supplied restriction when the managed document delegates the real
+        # policy to a fetched one.
+        #
+        # Attempts are IGNORED rather than raised. Raising would hand an unprivileged
+        # account a denial-of-service lever over a managed host, and the security goal
+        # is only that the override cannot take effect. Credentials are not affected:
+        # they live in KIROCREW_POLICY_HEADERS, are read elsewhere, and are per-machine
+        # by design.
+        pinned = [
+            POLICY_URL_ENV,
+            POLICY_REFRESH_ENV,
+            POLICY_TIMEOUT_ENV,
+            POLICY_MAX_AGE_ENV,
+            POLICY_UNAVAILABLE_ENV,
+        ]
+        # The ADDRESS is pinned whether or not the managed document named one. An
+        # earlier revision let KIROCREW_POLICY_URL supply the source when the managed
+        # block declared only the cadence (a "two-channel split": the fleet publishes
+        # the interval, whatever provisions the host publishes the URL). That was a
+        # hole, not a convenience: the environment is writable by the local account,
+        # so on a fleet whose managed profile delegated the real controls to a fetched
+        # document, that account could point the fetch at a document of its own and
+        # supply every control the managed profile left out. A managed declaration
+        # that wants a central document has to NAME it; a managed declaration with no
+        # source means the fleet has not chosen one, and the central tier stays off
+        # rather than taking an address from the one party it exists to bind.
+        if not base.source and os.environ.get(POLICY_URL_ENV, "").strip():
+            logger.error(
+                "the managed security policy declares a distribution with no source and "
+                "%s is set; the address is NOT taken from the environment. Name the "
+                "source in the managed document to enable central distribution.",
+                POLICY_URL_ENV,
+            )
+        attempted = sorted(name for name in pinned if os.environ.get(name, "").strip())
+        if attempted:
+            # The names are our own constants, never the values, which could be a
+            # credential-bearing URL.
+            logger.warning(
+                "ignoring %s: the managed security policy declares the central "
+                "distribution and a local environment override cannot redirect it",
+                ", ".join(attempted),
+            )
+            _audit_managed_override_ignored(attempted)
+        return base
 
     source = os.environ.get(POLICY_URL_ENV, "").strip() or base.source
     refresh = _env_number(POLICY_REFRESH_ENV, whole=True)
@@ -1241,7 +1322,9 @@ def reset_process_state() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def parse_distributed_policy(body: bytes, *, source: str) -> GovernanceCeiling:
+def parse_distributed_policy(
+    body: bytes, *, source: str, managed: bool = False
+) -> GovernanceCeiling:
     """Turn fetched bytes into a verified ceiling, or raise.
 
     Raises ``PlatformCompositionError`` on anything that makes the document
@@ -1249,6 +1332,10 @@ def parse_distributed_policy(body: bytes, *, source: str) -> GovernanceCeiling:
     mandated — not signed by a trusted issuer.  Every caller treats a raise as "do
     not adopt this document", which at boot means the unavailable disposition and
     on a live refresh means keeping the ceiling already installed.
+
+    ``managed`` is ``dist.managed``: the channel was declared by the MDM-managed
+    tier.  A managed declaration MANDATES a verified signature on the document it
+    delegates to -- see the gate below for why the opt-in alone is not enough there.
     """
     from kiro_crew.platform.governance import (
         _policy_signature_required,
@@ -1283,11 +1370,33 @@ def parse_distributed_policy(body: bytes, *, source: str) -> GovernanceCeiling:
     # the authority on whether it has to be authentic, or an attacker rewriting it
     # would simply clear the flag. The state test comes first because it is free,
     # while the opt-in reads a file.
-    if state != SIGNATURE_VERIFIED and _policy_signature_required():
+    #
+    # A MANAGED declaration mandates the signature without the opt-in. The managed
+    # document is root-owned and composes ABOVE this rung, so what a forged central
+    # document can do is bounded to the controls the fleet left unset -- but a fleet
+    # that DELEGATES its real controls to the fetched document has left them all
+    # unset, and the opt-in lives in ``admission_policy.json``, a file the local
+    # account can write and a delegating fleet may never have set. Everything the
+    # local account controls on the way to this document -- the cache directory
+    # (``KIROCREW_POLICY_CACHE_ONLY`` + a planted copy), the TLS trust store and
+    # proxy environment on the fetch -- is therefore closed by one rule at the one
+    # point every central document passes: a document the managed tier delegates to
+    # is refused unless a key the fleet provisioned verifies it. Bounded, not total:
+    # the key is read from ``admission_policy.json``, so this holds for an account
+    # that cannot write or redirect that file -- the keystone the ceiling already
+    # trusts (``_policy_trust_settings``). Pinning it into the managed document is
+    # the managed-trust follow-up. A delegating fleet
+    # that has not provisioned one fails CLOSED here (the central rung stays off and
+    # the managed document on disk still governs), which is the loud failure.
+    if state != SIGNATURE_VERIFIED and (managed or _policy_signature_required()):
+        why = (
+            "the managed security policy delegates to it"
+            if managed
+            else "require_policy_signature is set in the admission policy"
+        )
         raise PlatformCompositionError(
-            f"policy fetched from {label} is {state}, but require_policy_signature is "
-            "set in the admission policy; sign the published document and provision the "
-            "issuer's trust key there"
+            f"policy fetched from {label} is {state}, but {why}; sign the published "
+            "document and provision the issuer's trust key in the admission policy"
         )
     return ceiling
 
@@ -1367,7 +1476,9 @@ def load_distributed_policy(
     )
     if fresh_enough and cached is not None:
         try:
-            ceiling = parse_distributed_policy(cached.body, source=dist.source)
+            ceiling = parse_distributed_policy(
+                cached.body, source=dist.source, managed=dist.managed
+            )
             # Record it: a ceiling served from the cache is still a ceiling this tier
             # installed, and the 304 comparison in ``refresh_now`` reads an EMPTY digest
             # as "we do not know what is running" — so without this a cache-booted
@@ -1443,7 +1554,7 @@ def _load_cache_only(dist: PolicyDistribution) -> GovernanceCeiling:
     try:
         # No source: this child was deliberately not given one, and the metadata records
         # only a digest. The parameter is used for error text, so "" is the honest value.
-        ceiling = parse_distributed_policy(cached.body, source="")
+        ceiling = parse_distributed_policy(cached.body, source="", managed=dist.managed)
     except PlatformCompositionError as exc:
         raise PlatformCompositionError(
             f"the cached ceiling is unusable in cache-only mode: {exc}"
@@ -1671,7 +1782,7 @@ def _load_by_fetch(dist: PolicyDistribution, cached: Optional[CachedPolicy]) -> 
         body, provenance = fetched.body, dist.source
 
     try:
-        ceiling = parse_distributed_policy(body, source=dist.source)
+        ceiling = parse_distributed_policy(body, source=dist.source, managed=dist.managed)
     except PlatformCompositionError as exc:
         reason = _sanitize_detail(
             f"the ceiling published at {dist.source} is unusable: {exc}", dist.source
@@ -1806,7 +1917,7 @@ def _load_from_cached_winner(dist: PolicyDistribution, winner: CachedPolicy) -> 
                 "it was cached against a different source, so it is not this host's "
                 "last-known-good"
             )
-        ceiling = parse_distributed_policy(winner.body, source=dist.source)
+        ceiling = parse_distributed_policy(winner.body, source=dist.source, managed=dist.managed)
         migrated = _declared_source(winner.body)
         if migrated and migrated != dist.source and not _env_pins_the_source():
             raise PlatformCompositionError(
@@ -1895,7 +2006,7 @@ def _from_cache_on_outage(
         )
         return None
     try:
-        ceiling = parse_distributed_policy(cached.body, source=dist.source)
+        ceiling = parse_distributed_policy(cached.body, source=dist.source, managed=dist.managed)
     except PlatformCompositionError as exc:
         # Sanitised rather than a traceback, for the reason the loader's sibling arm gives.
         logger.error(
@@ -1938,6 +2049,13 @@ def fetch_once(dist: PolicyDistribution, cached: Optional[CachedPolicy] = None) 
         FetchRequest(
             url=dist.source,
             timeout_secs=dist.effective_timeout(),
+            # Per-machine headers pass through unfiltered, credentials included. A
+            # header that could redirect a MANAGED fetch (``Host`` on a shared reverse
+            # proxy) cannot substitute the document: ``parse_distributed_policy``
+            # mandates a verified signature on anything a managed declaration adopts,
+            # so a body served from the wrong vhost is refused there. An earlier
+            # revision dropped ``Host`` here as well; that was a per-spelling filter
+            # on a channel the mandate already closes, and it is gone.
             headers=request_headers(),
             etag=cached.etag if cached else "",
             last_modified=cached.last_modified if cached else "",
@@ -2054,28 +2172,6 @@ class RefreshOutcome:
     signature_state: str = ""
 
 
-def tier1_local_policy() -> str:
-    """The explicit local policy path that OUTRANKS this tier, or ``""``.
-
-    ``KIROCREW_SECURITY_POLICY`` is precedence tier 1 and the documented rollback
-    lever: an operator recovering from a bad central push pins a local file, and the
-    whole recovery story rests on that file winning. It has to win against a live
-    REFRESH as well as against a boot, and a refresh is where it is easiest to miss —
-    the poller is already running when the file appears.
-
-    Checked by path EXISTENCE rather than by inferring provenance from what this
-    process happens to have installed. That is what makes it exact: it asks the same
-    question ``load_security_policy`` asks, so the refresher cannot disagree with the
-    ladder. It also stays correct in the case digest-based inference gets wrong — a
-    host that booted UNGOVERNED under ``degrade`` and then becomes able to reach its
-    source has no tier-1 file, so the refresh proceeds and the ceiling finally binds.
-    """
-    raw = os.environ.get("KIROCREW_SECURITY_POLICY", "").strip()
-    if not raw:
-        return ""
-    return raw if Path(raw).exists() else ""
-
-
 def _body_digest(body: bytes) -> str:
     """A stable digest of a policy document's bytes.
 
@@ -2114,15 +2210,41 @@ def validate_ceiling(ceiling: GovernanceCeiling) -> None:
     from kiro_crew.platform.governance import assert_policy_signature_satisfied
     from kiro_crew.platform.governance_profiles import assert_profile_floor
 
-    tier1 = tier1_local_policy()
-    if tier1:
-        raise PlatformCompositionError(
-            f"refusing to install a centrally fetched ceiling while {tier1} supplies "
-            "one: KIROCREW_SECURITY_POLICY is precedence tier 1 and the rollback lever, "
-            "so a poll must not displace it"
-        )
     assert_policy_signature_satisfied(ceiling)
     assert_profile_floor(ceiling)
+
+
+def _recompose_differs(central: GovernanceCeiling) -> bool:
+    """Would re-folding the ladder around *central* change what the ladder last produced?
+
+    The question the 304 fast path in :func:`refresh_now` has to ask: the central
+    document is provably the one installed, but the managed rung above it and the
+    local rung below it are read from disk at compose time and can move without the
+    endpoint publishing anything. Composes exactly as :func:`apply_ceiling` does and
+    compares structurally -- ``GovernanceCeiling`` is a frozen dataclass, so equality
+    is the whole ladder's content, not identity.
+
+    The basis is the loader's OWN last fold (``governance.last_composed_ceiling``),
+    not ``current_context().governance``.  The installed object is whatever
+    ``bootstrap`` or the companion's ``compose`` put into the context after
+    ``load_security_policy`` returned, and any ``replace()`` or re-tagging on that
+    path makes it structurally unequal to the fold while meaning the same ceiling.
+    Compared against THAT, every quiet 304 would re-install and bump the governance
+    generation, invalidating everything keyed on it once per interval -- the exact
+    churn the "adopt only when it differs" rule exists to avoid.  Before the first
+    fold has been recorded there is nothing to compare but the context, so that is
+    the one-time fallback; the first install records a fold and every later poll has
+    a stable basis.
+    """
+    from kiro_crew.platform.context import current_context
+    from kiro_crew.platform.governance import compose_installed_ceiling, last_composed_ceiling
+
+    # ``last_composed_ceiling`` is what LANDED, never a fold the gates rejected -- so a
+    # tightening refused once is still "different" on the next poll and retried.
+    prior = last_composed_ceiling()
+    if prior is None:
+        prior = current_context().governance
+    return compose_installed_ceiling(central) != prior
 
 
 def apply_ceiling(ceiling: GovernanceCeiling) -> None:
@@ -2149,10 +2271,27 @@ def apply_ceiling(ceiling: GovernanceCeiling) -> None:
     a tightening.  The ordinal floor, which is what "would this host have started
     under the candidate" actually means, still applies.
     """
+    # Compose BEFORE validating and installing. A refresh replaces exactly one rung
+    # of the ladder, so installing the fetched document by itself would drop the
+    # managed authority above it and every local restriction below it -- a host
+    # tightened at boot would find that tightening gone at the first successful poll,
+    # a ceiling that loosens itself on a timer. Routing through the loader's own
+    # composition is what keeps boot and refresh from diverging, and validating the
+    # COMPOSED result means the floor gates judge what will actually govern.
     from kiro_crew.platform.context import current_context, set_context
+    from kiro_crew.platform.governance import compose_installed_ceiling, record_composed_ceiling
 
-    validate_ceiling(ceiling)
-    set_context(replace(current_context(), governance=ceiling))
+    composed = compose_installed_ceiling(ceiling)
+    # Validate the COMPOSED result, not the fetched rung: the floor gates judge what
+    # will actually govern, and a path that installs without validating admits a
+    # ceiling this host would have refused to boot under.
+    validate_ceiling(composed)
+    set_context(replace(current_context(), governance=composed))
+    # Recorded AFTER the install, so a fold the gates rejected is never the basis the
+    # next 304 poll compares against: were it recorded before, the next re-fold would
+    # equal the rejected one, read "nothing moved", and skip -- leaving the looser
+    # ceiling installed even after the operator fixed the profile.
+    record_composed_ceiling(composed)
 
     # NOTE: the selectable-ACP-backend set is deliberately NOT recomputed here.
     #
@@ -2201,19 +2340,6 @@ def refresh_now(*, force: bool = False) -> RefreshOutcome:
         )
     if not dist.enabled:
         return RefreshOutcome(REFRESH_NOT_CONFIGURED)
-    # Before spending a fetch: a tier-1 local file outranks this tier, so there is
-    # nothing a refresh could usefully install. ``apply_ceiling`` refuses too, as the
-    # hard guard; this arm exists so the operator gets a reason instead of a fetch
-    # followed by a rejection.
-    tier1 = tier1_local_policy()
-    if tier1:
-        detail = (
-            f"{tier1} (KIROCREW_SECURITY_POLICY) outranks the central source; "
-            "not fetching. Unset it to follow the fleet policy again."
-        )
-        logger.info("%s", detail)
-        return RefreshOutcome(REFRESH_REJECTED, _sanitize_detail(detail, dist.source))
-
     # Observed BEFORE the fetch, and this ordering is the whole control: the concurrent
     # publish this guards against lands DURING the fetch, so a snapshot taken afterwards
     # already includes it and the compare-and-swap below would pass while overwriting a
@@ -2286,13 +2412,39 @@ def refresh_now(*, force: bool = False) -> RefreshOutcome:
             # anything, and a 304 would otherwise let it stand indefinitely. Cheap enough
             # to do per interval.
             try:
-                parse_distributed_policy(cached.body, source=dist.source)
+                unchanged = parse_distributed_policy(
+                    cached.body, source=dist.source, managed=dist.managed
+                )
             except PlatformCompositionError as exc:
                 return _refresh_failure(
                     REFRESH_REJECTED,
                     dist,
                     f"the ceiling in effect no longer satisfies the trust root: {exc}",
                     incident="rejected",
+                )
+            # The OTHER rungs move on their own schedule too. The digest above answers
+            # only "is the central document the one installed"; the managed profile
+            # above it is re-asserted by the MDM on its own check-in, and a tightening
+            # it lands between two central publishes would otherwise reach the running
+            # ceiling only when the central body next changed -- a host below the
+            # authority's floor for as long as the endpoint stayed quiet. Re-fold the
+            # ladder here exactly as an install would and adopt the result when, and
+            # only when, it differs: a genuinely unchanged poll keeps the installed
+            # object (and its generation) untouched, so nothing downstream is
+            # invalidated for a no-op.
+            try:
+                if _recompose_differs(unchanged):
+                    logger.info(
+                        "the central document is unchanged but another tier moved; "
+                        "re-installing the composed ceiling"
+                    )
+                    apply_ceiling(unchanged)
+            except PlatformCompositionError as exc:
+                return _refresh_failure(
+                    REFRESH_REJECTED,
+                    dist,
+                    f"the ceiling in effect no longer composes on this host: {exc}",
+                    incident="compose",
                 )
             touch_cache(cached.meta(), etag=fetched.etag, last_modified=fetched.last_modified)
             # Hooks run on this path too, not just on an install. They are best-effort by
@@ -2309,7 +2461,7 @@ def refresh_now(*, force: bool = False) -> RefreshOutcome:
         body = cached.body
 
     try:
-        ceiling = parse_distributed_policy(body, source=dist.source)
+        ceiling = parse_distributed_policy(body, source=dist.source, managed=dist.managed)
     except PlatformCompositionError as exc:
         return _refresh_failure(
             REFRESH_REJECTED,
@@ -2728,15 +2880,9 @@ class _Refresher:
             return current
         if not dist.enabled:
             return 0
-        if tier1_local_policy():
-            # An operator pinned a local file mid-incident. Polling on would fetch and
-            # then refuse every cycle, so stop and say so once; the next boot resolves
-            # the ladder afresh.
-            logger.warning(
-                "a local KIROCREW_SECURITY_POLICY file now outranks the central source; "
-                "stopped polling"
-            )
-            return 0
+        # A local KIROCREW_SECURITY_POLICY file never stops this loop: it is a
+        # subordinate tier and tightens whatever the loop installs, so there is
+        # nothing for the refresher to stand down for.
         return dist.effective_refresh_interval() or current
 
     def last(self) -> Tuple[Optional[RefreshOutcome], float]:
@@ -2958,7 +3104,6 @@ __all__ = [
     "touch_cache",
     "reset_fetch_window",
     "reset_process_state",
-    "tier1_local_policy",
     "load_distributed_policy",
     "fetch_once",
     "apply_ceiling",

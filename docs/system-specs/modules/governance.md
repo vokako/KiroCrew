@@ -93,26 +93,91 @@ evaluator edits.
 
 ## Loading + precedence
 
-`load_security_policy()` precedence (first present wins):
+`load_security_policy()` precedence, highest first. The top two tiers are
+**authorities**; every tier below one of them may only **tighten** it:
 
-1. `KIROCREW_SECURITY_POLICY` env path — fleet hot-override, highest.
+1. **the MDM-managed configuration profile** — a root-owned file the device
+   management system re-asserts on every check-in (`_managed_policy_path()`, macOS
+   and Linux only; the tier is **absent on Windows**).
+   Highest because it is the only channel a standard user cannot write: an
+   environment variable is per-process and redefinable by whoever launches the
+   process, so an MDM can *set* one but never *pin* one. See
+   [The managed tier](#the-managed-tier-mdm-owned-highest).
 2. **the centrally distributed document** — fetched from `KIROCREW_POLICY_URL` or
    from the `distribution.source` a lower tier declares, served from the
    last-known-good cache when the endpoint is unreachable. See
    [Central distribution](#central-distribution-distribution--policy-only).
-3. companion-bundled resource (the `amazon` edition packages it; the public core
+3. `KIROCREW_SECURITY_POLICY` env path — the local operator channel.
+4. companion-bundled resource (the `amazon` edition packages it; the public core
    passes `None`).
-4. `~/.kiro/crew/security_policy.json` — standalone operator-authored.
-5. none → `None` → editable secure-defaults (ungoverned ceiling).
+5. `~/.kiro/crew/security_policy.json` — standalone operator-authored.
+6. none → `None` → editable secure-defaults (ungoverned ceiling).
 
-Tier 1 stays above the central tier because it is the **rollback lever**: one
-document governing every host is the widest blast radius in this model, and an
-operator recovering from a bad push needs a channel that outranks the thing that
-broke. Tiers 3 and 4 sit below it because they are what the fetched document
-*replaces* — a fleet that ships a bootstrap policy naming a source expects the
-source to win, or the bootstrap could never be superseded.
+**Tiers 3–5 are mutually exclusive** (first present wins among them) and
+collectively form the *subordinate*; tiers 1–2 stack above it. The composed result
+is `managed ∘ central ∘ subordinate` under `_intersect_ceilings`, which reuses
+`_compose_controls` — the same per-scope AND the profile layer uses (allow∩, deny∪,
+ordinal=stricter, gate=AND) — so "a lower tier cannot widen" is a property of the
+primitive rather than a rule the loader polices. A scope the subordinate governs
+and the authority does not carries through, because an ungoverned scope is
+*unrestricted* and adding a restriction to it is a tightening; a scope the
+authority governs and the subordinate omits keeps the authority's value, because a
+subordinate cannot repeal by omission. Everything outside `controls` stays the
+**authority's** — identity, signature state, tier and `updates` pins — so a
+subordinate document cannot relabel whose ceiling this is or relax an update pin. Two things follow a
+declared-wins rule instead, because for them "the authority's" is only meaningful
+when the authority actually said something:
 
-The home path (step 4) is resolved through the **lazy `_policy_home_path()`
+- `fallback`: the authority's wins if it declared one and otherwise the
+  subordinate's applies, since a fallback only ever narrows what an unusable
+  profile file would have allowed.
+- the `distribution` pins: the **highest tier that declared any** supplies them, for
+  every tier that takes part in the fold. A lower tier still cannot redirect a
+  fetch source its authority chose — that is the property the pins exist for — but
+  when no tier above it declared any there is no choice to redirect away from, and
+  the fetch source a lower tier declares is exactly the self-refresh case tier 2
+  above is defined in terms of. Taking "the authority's" unconditionally instead
+  meant an authority silent about distribution **discarded** the pins beneath it,
+  switching the central tier off and dropping every centrally supplied restriction.
+  `compose_tier_ladder` tracks the effective value as the fold proceeds and
+  re-applies it on every exit, so no path that rebuilds a ceiling can drop it.
+
+The fold itself is **`compose_tier_ladder`**, the single implementation of
+precedence: highest present tier is the authority, and each lower one may only tighten
+it. There is deliberately no path by which a lower tier replaces the authority. A
+rollback that cleared the pins would stop central tightenings arriving and leave
+nothing able to re-fetch the central document once the dated window closed, which
+is an override outliving its own expiry. A central refresh re-runs that same function through
+`compose_installed_ceiling` (see
+[The live swap](#the-live-swap-and-the-cache-it-invalidates)), so boot and refresh
+cannot drift — there is only one implementation of precedence to drift from.
+
+Each distinct composition pair is audited **once per process**
+(`security_policy_tier_intersect`, latched on the `(authority, lower)` pair in
+`_TierProcessState.tier_intersects_audited`) with the tier NAMES only — module constants this process
+authored, never a path or URL from the document, the same rule the distribution
+audit follows. Once, because `load_security_policy` runs per app callback and the
+pairs it folds do not change between calls; a row per compose was a row per
+interaction for a fact that never changed, burying the one-time absence and
+env-inversion signals. A tier that appears later (an env document set after boot)
+is a new pair and is still recorded.
+
+**Why the env tier no longer outranks the central push.** It used to, as the
+rollback lever for a bad central document. That made the enterprise ceiling
+advisory: any account that can set an environment variable could point it at a
+permissive file and the fleet's ceiling never bound.
+
+A time-boxed local override (a dated `break_glass` grant an authority document could issue to a lower tier) was designed for this change and **withdrawn before merge**: a channel by which a local document outranks the fleet ceiling is the override this ladder exists to remove, and the reviewed design carried its own expiry-handling and cache-trust defects. Recovery from a bad central push is by re-publishing a good document at the source. The override is tracked as the follow-up issue [#9106](https://github.com/kirodotdev/KiroCrew/issues/9106), not shipped here.
+
+**The inversion announces itself once.** An upgraded fleet whose runbook still reads
+"set `KIROCREW_SECURITY_POLICY` to roll back" would otherwise learn mid-incident that the
+file now only tightens. So the first time an env document composes **beneath** a managed
+or central authority, `_warn_env_beneath_central_once` logs a warning and writes one
+best-effort SEL row (`security_policy_env_tightens_only`, `<authority><-env`), latched by
+`_TierProcessState.env_beneath_central_warned` for the process lifetime. An env document governing alone,
+or a home document beneath an authority, is not an inversion and is not announced.
+
+The home path (step 5) is resolved through the **lazy `_policy_home_path()`
 accessor**, never a module-level `config_dir()` capture — so importing
 `platform.governance` (or `platform.admission`, whose `_policy_default_path()` /
 `_seed_marker_path()` / `_checksum_path()` follow the same pattern) never
@@ -122,105 +187,241 @@ an import side effect. The migration runs only at the single chosen point
 platform layer side-effect-free load-bearing infrastructure. Tests patch these
 accessors, not captured constants.
 
-A **present-but-unreadable / invalid** policy raises `PlatformCompositionError`
-(fail-closed to strictest), mirroring `admission.load_admission_policy`. Parsing
-is **pure-Python and structural** (it does not depend on `jsonschema`, which is
-an optional, possibly-absent dependency) so a malformed policy never silently
-degrades to ungoverned.
+A **present-but-unreadable / invalid** policy at the managed, env or home path
+raises `PlatformCompositionError` (fail-closed to strictest), mirroring
+`admission.load_admission_policy` — as does a managed file that is not root-owned,
+is group/world-writable, or carries a POSIX ACL entry granting write to a named
+non-root user or group, because falling through to a lower tier there would
+restore the very override this order removes. The ACL question is asked of the
+**file** (`system.posix_acl_access` is read and its entries walked, with each named
+entry limited by the `ACL_MASK` entry as `acl(5)` prescribes, so `user:alice:rw-,mask::r--`
+is the read-only grant the kernel enforces, not a refusal), never of the
+process — "can *I* write this" is always yes as root, so a check phrased that way
+was skipped on a root-run gateway and a `user:me:w` grant went unchecked there. A
+file whose ACL cannot be read (no xattr support, macOS's different ACL model) is
+judged on its mode bits alone; an unreadable ACL is not evidence of write access.
+**macOS is the recorded limit of that check, not an oversight:** Darwin ACEs live behind
+`acl_get_file(3)`, which the standard library does not expose (`os.getxattr` does not exist
+there), a `ctypes` libc binding cannot be honestly tested from the Linux CI host, and a
+`ls -lde` subprocess is a blocking call on a path `mcp_gateway.app_call` re-runs per app
+callback on the event loop. The check defends against **misprovisioning** — root having
+granted a local account write — not against a root attacker, who defeats any file-side
+predicate; on macOS that fact is the fleet's to verify against the MDM profile payload the
+ACL came from. Parsing is **pure-Python and
+structural** (it does not depend on `jsonschema`, which is an optional,
+possibly-absent dependency) so a malformed policy never silently degrades to
+ungoverned.
 
-## Update pins (`updates`) — policy-only
+### The managed tier (MDM-owned, highest)
 
-Replacing the running code is the widest privileged action the host performs: a
-self-update rewrites every other ceiling in this document, because the deny
-catalog, the sensitive-path list and the evaluator are *code*. Two enterprise
-pins ride in the policy file for it:
+`_read_managed_policy()` reads a document the device-management system owns. The
+path is per-platform and resolved through a **function**, like
+`_policy_home_path()`, so tests can point it somewhere writable — and deliberately
+**not** overridable by an environment variable, which would hand back the exact
+weakness the tier exists to close:
 
-```json
-"updates": {
-  "source": "https://git.corp.example/platform/*",
-  "min_version": "1.4.0"
-}
-```
+| Platform | Path | Owner |
+|---|---|---|
+| macOS | `/Library/Managed Preferences/dev.kirocrew.plist` | Jamf / Intune for Mac, as a configuration profile |
+| Linux | `/etc/kirocrew-managed/security_policy.json` | root, written by config management (Ansible, Puppet, Intune for Linux) |
+| Windows, and anything else | — | tier is absent: `_managed_policy_path()` returns `None`, so no managed document is read |
 
-- **`source`** — an fnmatch glob over the git remote URL new code may come from
-  (a glob so one pin covers a mirror set, and so non-URL remote shapes —
-  SCP-style, local path — are pinnable). Empty = unpinned. A checkout whose
-  remote cannot be resolved is **denied when a pin exists**: an admin's pin must
-  not be satisfied by "we could not tell".
-- **`min_version`** — the minimum version the fleet may run. A host below it
-  takes a **mandatory** update, overriding the user's `auto_update=false`
-  (user config sits under the enterprise ceiling). It never refuses to *boot*:
-  bricking a fleet on a policy typo would remove the surface an admin needs to
-  fix it. An unparseable floor imposes none, for the same reason.
+The reverse-DNS domain matches `service.common.LAUNCHD_LABEL`'s namespace
+(`dev.kirocrew.*`) so an admin authors **one** preference domain per product. A
+`.plist` suffix is parsed with `plistlib`; anything else as UTF-8 JSON. Either way
+the document is the same schema as every other tier.
 
-**Not an archetype, by design.** Every archetype answers "is X permitted?"; a
-remote URL and a version number are *values the core consumes*. So they ride
-outside `controls` — no `SCOPE_CATALOG` row, no matcher, no evaluator change.
-What makes them enterprise-*pinnable* is the file they live in: the trust-root
-`security_policy.json` is on the `security._SENSITIVE_HOME_DIRS` keystone, so the
-agent can neither read nor write its own ceiling. A `config.json` field or an env
-var would only be a suggestion.
+**A managed document must be JSON-native, and a plist that is not is refused at read
+time.** `plistlib` decodes `<date>` to `datetime` and `<data>` to `bytes`, neither of
+which `json.dumps` can serialize — and the signature payload is canonical JSON over
+the **raw** document (`policy_signing_payload` → `admission.canonical_signing_bytes`,
+which passes no `default=`). So a *signed* profile carrying a plist-native date raised
+`TypeError` out of `_verify_policy_signature`, a function documented never to raise;
+`context.safe_context_call` re-raises only `PlatformCompositionError` and degrades
+every other exception to open-source defaults, which silently **removed** the top-tier
+fleet ceiling. Signing a profile made the host *less* governed, inverting
+`require_policy_signature` — and a `<date>` for any timestamp field is the idiomatic
+MDM spelling, so this was the ordinary authoring mistake, not an exotic one.
 
-**Policy-only — rejected in a Level-2 profile** (`parse_profile` raises). A
-profile is narrow-only and there is no narrower version of *pointing somewhere
-else*; a per-app profile that could redirect the update source would be
-privilege escalation.
+`_assert_json_native_document` therefore walks the parsed mapping and raises
+`PlatformCompositionError`, naming the offending key path and the remedy (write an
+ISO-8601 `<string>`). Refused rather than coerced: coercing would invent a
+canonicalization no signer implements — the signature covers canonical JSON of the
+document *as read*, and no plist-side signing procedure produces those bytes — so a
+correctly signed profile would verify as UNVERIFIED instead of crashing, trading a loud
+failure for a silent authentication one and freezing the choice of coercion into the
+trust root's byte contract. The check runs at read time and so does not depend on the
+document being signed: a value with no canonical form cannot be signed later either.
+Operator-visible consequence: a console that emits `<date>` for a timestamp now gets a
+hard refusal naming the fix, rather than a working ceiling that cannot be authenticated.
 
-`platform/update_governance.py` is the one seam the three update paths share
-(`POST /api/update`, `kirocrew update`, the gateway-boot auto-apply) so they
-cannot drift. It resolves the remote git would *actually* fetch from — reading
-`branch.<name>.remote` rather than assuming `origin`, via `ls-remote --get-url`
-so `url.<base>.insteadOf` rewriting is applied — and returns a blocking reason or
-`""`. **A pin blocks; an unresolvable pin does not:** if governance cannot be read
-at all the update proceeds, because refusing one would strand a host on a build
-that may need a patch. These are a routing constraint for a managed fleet, not a
-boundary against a local operator who could edit the checkout directly.
+**Windows has no managed tier, deliberately** — and no path constant either, because
+naming one is what tempted the first implementation into resolving it from the
+`ProgramData` **environment variable**. That resolves the supposedly un-writable
+location from a variable the launching user controls, and the ownership check cannot
+compensate: there is no uid to compare, so `_assert_managed_file_trusted` returns
+after the regular-file test and nothing else survives. Together those two make a
+standard user able to point the **top** authority at a file they wrote — strictly
+worse than having no managed tier at all, since it is the very loosening this tier
+exists to prevent, wearing the tier's own authority. Enabling it needs the
+non-overridable known-folder API (`SHGetKnownFolderPath(FOLDERID_ProgramData)`) plus
+a real ACL check and reparse-point handling, none of which can be honestly tested
+from a POSIX host. Until that lands, Windows reads as "no managed document", which is
+the pre-existing behaviour rather than a false guarantee.
 
-**Roll the build before the pin.** The parser fails closed on an unknown key, so a
-build predating `updates` refuses to boot on a pinned policy — which inverts the
-`min_version` case, since the stale hosts a floor targets are exactly the ones
-that would stop booting. Recovery is a manual `kirocrew update`.
+**Absent means inert.** No managed file → `None` → the tier costs nothing to ship,
+and every existing standalone install is unchanged. **Present means it governs**:
+a file that is untrusted, unreadable, oversized (> 1 MiB, a bound on a mistake
+rather than on an intention) or not a JSON/plist object raises, because a fleet
+that placed a document there meant it to bind.
 
-## Central distribution (`distribution`) — policy-only
+**The open is the existence test**, with no `exists()` pre-check ahead of it. That
+pre-check read as harmless and was a downgrade path: `exists()` raises EACCES when the
+managed *directory* is root-only — precisely how a hardened fleet configures
+`/etc/kirocrew-managed` — and an EACCES taken for "no managed policy" handed governance to
+whatever local tier sat below, so hardening the directory switched off the ceiling the
+hardening was protecting. It was a TOCTOU window besides. Only `FileNotFoundError`
+means absent; every other `OSError` refuses boot with a message naming the path. The
+operator consequence is about permissions rather than ownership: root-owned is right
+and stays right, but the account Kiro Crew runs as must be able to *open* the file, so
+a mode or a parent directory that excludes it is a hard startup failure rather than a
+silent downgrade.
 
-`platform/policy_distribution.py` is how an enterprise IT admin owns **one**
-`security_policy.json` and every machine in the fleet follows it. Each host fetches
-the document from a central location, keeps the last-known-good copy on disk, and
-re-fetches on an interval, so a pushed change binds **without a restart, a
-redeploy, or a visit to the host**. This closes the gap the field manual named
-outright: distribution used to be entirely the customer's config-management
-tooling, with no seam on this side of it.
+That is also why the Linux path is `/etc/kirocrew-managed/`, a sibling of the
+service's `/etc/kirocrew/` rather than a file inside it. `service.linux.ENV_DIR` is
+`/etc/kirocrew`, the service installer creates it, and under a hardened umask it came
+out `0750`/`0700` root-owned — a directory the non-root gateway could not search.
+Opening a file that is not there beneath such a directory answers EACCES, not ENOENT,
+so a managed path *inside* the installer's directory turned "installed the service on
+a CIS image" into a boot abort on a host no fleet ever provisioned. A directory nothing
+else creates cannot be misread that way; `_seed_env_file` now also creates its own
+directory with an explicit `0755` so the collision cannot recur through the installer,
+and `test_the_managed_path_is_not_under_the_service_env_dir` pins the two apart.
 
-`GovernanceCeiling.distribution` is the parsed declaration; the module is the
-engine. Like [`updates`](#update-pins-updates--policy-only) it is **not an
-archetype** — every archetype answers "is X permitted?", while a URL and an
-interval are values the core consumes — so it rides outside `controls` with no
-`SCOPE_CATALOG` row, no matcher, and no evaluator change.
+`_assert_managed_file_trusted` checks the tier's own claim rather than assuming it,
+against an already-open descriptor so the answer cannot change between the check
+and the read. The open uses `O_NOFOLLOW` (a symlink planted at the managed path is
+refused) and `O_NONBLOCK` (a FIFO cannot block the open before the regular-file
+check rejects it). It then requires a **regular file**, **uid 0**, and **no
+group/world write bit** — anyone in the group could otherwise rewrite the fleet
+ceiling. Every failure raises rather than falling through: a user-writable file at
+a managed path is either a misconfiguration or an attempt, and neither should
+quietly widen the ceiling. The uid and mode tests are POSIX-only; the non-POSIX
+early return is unreachable in production, because `_managed_policy_path()` hands the
+reader no path on Windows, and it survives only so a test that points the accessor at
+a writable location still gets the regular-file check.
 
-```json
-"distribution": {
-  "source": "https://config.corp.example/kirocrew/policy.json",
-  "refresh_interval_secs": 900,
-  "max_cache_age_secs": 86400,
-  "on_unavailable": "fail_closed"
-}
-```
+**An absent managed document is REPORTED, not refused.** The check above judges a
+document that is *present*. When the open raises `FileNotFoundError` the tier is inert
+and a local tier governs. `load_security_policy` records that **once, at boot**,
+through `_audit_managed_absent` (SEL operation `security_policy_tier_absent`, resources
+`managed<-absent`) rather than deciding anything about it. The reader itself stays
+silent: `_read_managed_policy` also runs on every central refresh and every local
+recompose, and absence is a fact about provisioning that does not change between polls,
+so a per-read record would append one HMAC-chained row per interval per standalone host
+for a decision that decided nothing (the same rule `_audit_refresh` applies to an
+unchanged poll). A platform with no managed path at all (Windows) records nothing.
 
-**Policy-only — rejected in a Level-2 profile** (`parse_profile` raises). This is a
-stronger version of the `updates` argument, not the same one: redirecting where the
-ceiling is *fetched from* is not a narrowing at all, it replaces the whole
-enforcement document, which is the widest escalation the model has.
+This is a deliberate reversal of an earlier design, and the reasoning is worth keeping
+because the opposite conclusion is the intuitive one. Absence has two causes — never
+provisioned, or the document was deleted — and they are the **same syscall result**, so
+the host cannot tell them apart. A guard that inferred the cause from the holding
+directory's owner and mode was implemented and withdrawn, for four reasons that are
+structural rather than a matter of tuning the predicate:
+
+- **It does not stop the adversary it names.** An account with root tightens the managed
+  directory to root-owned and non-group-writable *first* and unlinks the document
+  *second*; every filesystem-forensic predicate then reads a pristine directory and
+  answers "genuine absence". The only party it ever stopped was a **non-root** account on
+  a **misconfigured** host.
+- **On a correctly provisioned host it is unreachable.** A real fleet's managed directory
+  is root-owned and not group-writable, which every version of the predicate answered
+  "genuine" for — so it never fired where the fleet cares.
+- **Where it did fire, it fired on honest hosts, and the failure mode was a boot abort.**
+  Successive revisions each aborted a different legitimate shape: standalone macOS
+  (`/Library` is `drwxrwxr-t root admin` and the default account is in `admin`), id-mapped
+  NFS and container userns hosts (`/etc` owned by uid 65534 `nobody`), root-run installs,
+  and Windows.
+- **The presence check already covers the dangerous host.**
+  `_assert_managed_file_trusted` refuses a document whose ownership or ACL lets a local
+  account rewrite it, so a sloppily provisioned host is already rejected whenever a
+  managed document exists. The guard only added the narrow "loose host **and** the
+  document is already gone" cell.
+
+So the division of labour is: the host reports its effective tier truthfully, and the
+**fleet** — which knows which hosts it provisioned, and which the adversary does not
+control — compares that against its own records and revokes centrally. Detection belongs
+to the party the adversary does not control. Escape-by-deletion is therefore an accepted,
+documented residual that is made **visible**, not a hole this tier claims to have closed.
+
+The audit is best-effort and never fatal. Absence is the
+common case (every standalone install reaches it), so gating a governance decision on an
+SEL write would let one unwritable audit file refuse boot across a fleet. Only the tier
+NAME is recorded, never the path — same rule as `_audit_policy_tier`, since the SEL is
+readable through agent-reachable surfaces and the managed path is fleet control-plane
+detail. The operator gets the path from the gateway log.
+
+**What this does and does not buy.** A standard user cannot loosen the ceiling at
+all: there is no tier they can write that widens it, and the one channel that
+outranks the fleet document is a root-owned file. An **admin** who edits the
+managed file has that edit reverted by the MDM on its next check-in and left in the
+audit trail. Neither of those binds a user with **local root**, who can rewrite the
+managed file or edit the installed Python — the wheel installs readable `.py` files
+and obfuscating them would not be a boundary. Making the ceiling hold against root
+requires server-side attestation (the client proving which policy digest it loaded,
+with no service on a mismatch), which is out of scope here and tracked as step 7 of
+[the RFC](../../request-for-change/rfc-central-governance-ceiling.md).
 
 ### Two source channels, and why the split
 
 | Channel | Where | For |
 |---|---|---|
 | `KIROCREW_POLICY_URL` (+ the `KIROCREW_POLICY_*` siblings) | per-machine env | The **fleet lever** — the same role `KIROCREW_SECURITY_POLICY` plays. A config-management push sets one variable; no file to place, no package to rebuild. |
-| `distribution.source` in a policy a LOWER tier supplies | the policy document | **Self-refresh.** A fleet places one bootstrap policy once (or an edition bundles it) and that document names where its own successors come from. |
+| `distribution.source` in a policy any other tier supplies | the policy document | **Self-refresh.** A fleet places one bootstrap policy once (or an edition bundles it) and that document names where its own successors come from. |
 
 The env channel wins **per setting**, so a host can be redirected to a canary
 endpoint or have its interval lengthened during an incident without editing — and
 re-signing — the published document.
+
+**Unless the managed tier declared it.** A declaration the managed document supplied is
+not redirectable from the environment: `resolve_distribution` ignores the refresh,
+timeout, max-age and on-unavailable variables outright, and `KIROCREW_POLICY_URL` too
+**when the managed block names a `source` of its own**, because honouring them would let
+any account that can set a variable choose
+which document becomes the fleet ceiling — the exact redirection the managed tier exists
+to close, and enough to strip every centrally supplied restriction whenever the managed
+document delegates the real policy to a fetched one. The attempt is **ignored rather
+than refused**: raising would hand an unprivileged account a denial-of-service lever
+over a managed host, while the security goal is only that the override cannot take
+effect. It is not silent — a warning names the variables it ignored and never their
+values, since a URL can carry a credential, and a governance audit record is written.
+A managed block that names **no** `source` leaves the central tier **off**. It does
+**not** take the address from `KIROCREW_POLICY_URL`: the environment is the local
+account's, and on a fleet whose managed profile delegates the real controls to a
+fetched document, honouring it would let that account point the fetch at a document
+of its own and supply every control the profile left out. (An earlier revision did
+honour it, as a "two-channel split" convenience for provisioners that could not
+write the URL into the profile; that was a hole, not a convenience, and was closed in
+review.) A managed declaration that wants a central document must name it. The
+cadence pins still hold in that state, and an operator who set the variable is told
+in the log that it was not taken.
+
+A managed document that carries **no `distribution` block at all** is pinned in no
+respect: the flag tracks the declaration, so `_managed_ceiling` sets it only when the
+document actually has the key. Setting it regardless refused the cadence variables on
+behalf of a fleet that had expressed no cadence — discarding an operator's own
+`KIROCREW_POLICY_REFRESH` on a host whose profile is silent about distribution, which
+protects no fleet choice because none was made.
+
+Credentials are unaffected: `KIROCREW_POLICY_HEADERS` is still honoured, because a
+per-machine credential is not the fleet's choice of document. A declaration from any
+other tier keeps the per-setting env override above, which is a standalone operator
+deciding where their own ceiling comes from.
+
+The flag carrying that distinction is `PolicyDistribution.managed`, and **no document
+can set it** — `from_dict` never parses it, deliberately, because a document able to
+claim it was managed would be claiming its own un-overridability. Only the loader marks
+it, since only the loader knows which tier it read the block from.
 
 **No credentials in the document, and no provenance flag either.** `distribution`
 has no `headers` field on purpose: a document published to the whole fleet must not
@@ -233,7 +434,16 @@ be authentic, which is exactly what `_policy_trust_settings` already refuses by 
 `require_policy_signature` in the admission policy, which is on the keystone and
 which a fetched document cannot reach.
 
-The peek that resolves a lower tier's declaration (`_declared_distribution`)
+The peek runs in the same order the tiers themselves do — managed, then the
+`KIROCREW_SECURITY_POLICY` document, then bundled, then home — so where a source may be
+declared and which declaration wins are one question rather than two. The env document
+belongs in that chain because it is tier 3, above bundled and home; its absence from the
+chain meant an operator who put `distribution.source` in the file
+`KIROCREW_SECURITY_POLICY` names got no central tier at all. That document is read once
+and handed down to the subordinate tier, so the peek and the tier cannot disagree about
+its bytes.
+
+The peek that resolves a declaration (`_declared_distribution`)
 deliberately validates **only** the `distribution` key. A policy whose other keys
 are malformed must fail at its own tier with its own message; a malformed
 `distribution` block does raise, because a fleet that mistyped where its ceiling
@@ -252,7 +462,8 @@ with no cache at all, `on_unavailable` decides:
 - `fail_closed` (**the default**) aborts boot. A fleet that pointed a host at a
   central ceiling meant that ceiling to bind, so "we could not tell" must not read
   as "run unbounded". Recovery is `KIROCREW_POLICY_ON_UNAVAILABLE=degrade`, unsetting
-  `KIROCREW_POLICY_URL`, or the tier-1 local file.
+  `KIROCREW_POLICY_URL`, or the tier-1 local file — none of which reaches a host whose
+  managed document declared the source, where the recovery is an edit to that document.
 - `degrade` falls through to the next precedence tier and records a
   `mark_governance_incident("degraded", …)` so the dashboard indicator shows it.
 
@@ -270,24 +481,15 @@ administrator superseded.
 **The pushed document is bad.** At boot there is nothing to fall back to, so it fails
 like any other tier. On a **live refresh it is REJECTED and the running ceiling is
 kept** — `apply_ceiling` runs `assert_policy_signature_satisfied` **and**
-`assert_profiles_within_ceiling` on the candidate before installing it, so a refresh
-can never install a ceiling this host would have refused to start under. That
-asymmetry is what stops one typo taking down a fleet that is already up. A refused
-document is **never cached**, so a rejection does not persist as a poisoned
-last-known-good after the push is corrected.
+`assert_profile_floor` on the **composed** candidate (the fetched document folded back
+into the tier ladder) before installing it, so a refresh can never install a ceiling
+this host would have refused to start under. That asymmetry is what stops one typo
+taking down a fleet that is already up. A refused document is **never cached**, so a
+rejection does not persist as a poisoned last-known-good after the push is corrected.
 
 ### The live swap, and the cache it invalidates
 
-**Tier 1 wins against a refresh, not only against a boot.** `KIROCREW_SECURITY_POLICY`
-is the rollback lever, and an operator pins it mid-incident — while the poller is
-already running. `tier1_local_policy()` decides by asking the same question the loader
-ladder asks (does that path exist), rather than inferring provenance from what this
-process installed, and it guards three points: `refresh_now` refuses before spending a
-fetch and says why, the background loop stops itself once a rollback lands, and
-`apply_ceiling` raises as the hard guard so no future path can install over tier 1.
-Deciding by path existence is also what keeps the opposite case right — a host that
-booted ungoverned under `degrade` has no tier-1 file, so its first successful refresh
-does bind.
+**A local file is never a reason for a refresh to stand down.** `KIROCREW_SECURITY_POLICY` is a subordinate tier that *tightens* the fetched ceiling, so the refresher keeps polling with one present; a poll that installs a tighter central document is composed with the local one, not blocked by it. There is no local channel that outranks the central document (see the precedence section above for the withdrawn `break_glass` design).
 
 **Validate, then publish, then install** — in that order, and the order is the point. A
 cache-only child adopts whatever the cache holds, so installing before publishing leaves a
@@ -302,8 +504,26 @@ cache-only child inherits the ceiling *from that file*, so a swallowed write fai
 leave the gateway enforcing a tighter ceiling while every app backend spawned afterwards
 adopted the looser one. A failed publish keeps the running ceiling and reports `rejected`.
 
-`apply_ceiling` validates a candidate the way boot does and then installs it with
-`set_context(replace(current_context(), governance=…))`. Every enforcement
+**A refresh recomposes the ladder; it does not install the fetched document alone.**
+`apply_ceiling` calls `compose_installed_ceiling(fetched)` first, which re-reads the
+managed profile and the subordinate tier and folds all three through the same
+`compose_tier_ladder` the loader uses. Installing the fetched rung by itself would drop
+the managed authority **above** it and every local restriction **below** it, so a host
+a fleet tightened at boot would find that tightening gone at its first successful poll
+— a ceiling that loosens itself on a timer. One composition function on both paths is
+the invariant: boot and refresh cannot diverge, because there is only one
+implementation of precedence to diverge from.
+
+The bundled tier is the one rung a recomposition cannot re-derive — only the edition
+that booted the process supplies a `bundled_loader` — so `load_security_policy`
+remembers the document it resolved in `_TierProcessState.last_bundled` and
+`compose_installed_ceiling` reads it from there. Without that, the bundled tier would silently drop out of the
+ladder at the first refresh, loosening a ceiling an edition tightened. The packaged
+resource is static for the process lifetime, so caching it is sound.
+
+`apply_ceiling` then validates that **composed** result the way boot does — so the
+floor gates judge what will actually govern rather than one rung of it — and installs
+it with `set_context(replace(current_context(), governance=…))`. Every enforcement
 chokepoint reads `current_context().governance` per decision rather than capturing
 it, so the swap binds on the next call.
 
@@ -323,6 +543,20 @@ without the endpoint publishing anything, so an unconditional `unchanged` would 
 stand indefinitely. The cached body is re-parsed on every unchanged poll, which is cheap at
 one per interval.
 
+**A `304` re-folds the ladder too.** The digest comparison below answers only "is the
+central document the one installed"; the managed profile above it is re-asserted by the
+MDM on *its* check-in, and a tightening it lands between two central publishes would
+otherwise reach the running ceiling only when the central body next changed — a host
+below its authority's floor for as long as the endpoint stayed quiet. So the unchanged
+path calls `_recompose_differs`, which folds the ladder exactly as `apply_ceiling` does
+and compares the result **structurally** with the installed ceiling (`GovernanceCeiling`
+is a frozen dataclass; no second digest is kept — the installed ceiling is the record of
+the last fold). Only when they differ is `apply_ceiling` run; a genuinely unchanged poll
+keeps the installed object and its generation untouched, so nothing keyed on the
+generation is invalidated for a no-op. gatewayd's per-app-call `load_security_policy`
+never had this gap — it re-reads every tier on every call — so the fix closes the
+refresher-installed plane, the only one that could go stale.
+
 **A `304` is judged against the installed ceiling, not the cache.** The cache is
 written by other processes too (gatewayd's per-app-call reload, an app backend's
 boot, `kirocrew policy fetch`), so "the source has nothing newer than the cache"
@@ -330,9 +564,9 @@ does not imply "this process is already running it". `refresh_now` keeps the dig
 of the document it installed and adopts the cached body when the two differ;
 without that, one `policy fetch` would cache a new revision and the poller would
 report `unchanged` forever while the gateway kept enforcing the old one. An EMPTY
-digest means the running ceiling came from another tier — a tier-1
-`KIROCREW_SECURITY_POLICY` file, say — and a poll must never displace it, so that
-case reports `unchanged` and installs nothing.
+digest means the running ceiling came from another tier — a granted
+`KIROCREW_SECURITY_POLICY` rollback, say, or the managed profile — and a poll must
+never displace it, so that case reports `unchanged` and installs nothing.
 
 One cache did have to change. `context.set_context` — routed through the single
 `_install` writer, so no install site can forget — now bumps
@@ -835,9 +1069,24 @@ outage. It is retained whenever `KIROCREW_POLICY_URL` names the address the sett
 and `resolve_distribution` overlays the environment onto it, which is what lets the two
 channels combine at all. With no address from either channel the tier stays inert.
 
-**Both guards defer to an environment pin.** `resolve_distribution` lets the environment win
-per setting precisely so whatever provisions the host owns the address, and two rules had to
-learn that. A `distribution` block with settings but no `source` is legitimate when
+**The managed tier tolerates the same block instead of refusing it.** `from_dict`'s refusal of
+settings-without-source argues that a host which never fetches is ungoverned while its file
+reads as managed — true for a home or env document, whose controls delegate to the fetched one,
+and false on the managed tier, where the managed document *is* the ceiling and central-off leaves
+the host fully governed by it. Refusing there turned an MDM authoring slip (pin the cadence,
+forget the address) into a fleet-wide boot abort. `parse_policy(..., managed=True)` — set only by
+`_managed_ceiling` — turns that raise into a warning and one
+`security_policy_managed_distribution_sourceless` audit row; the block is kept for its settings
+and central stays off. The declaration is also **returned marked** by `_declared_distribution`
+rather than dropped, because `resolve_distribution` refuses `KIROCREW_POLICY_URL` only for a
+declaration it can see is managed: an earlier revision answered `None` for a source-less
+managed block, handed the engine no declaration, and with the variable set fetched from the
+local account's address — the redirection the pin exists to refuse.
+
+**Both guards defer to an environment pin — for the non-managed tiers.** `resolve_distribution`
+lets the environment win per setting on a standalone host, so whatever provisions that host
+owns the address, and two rules had to learn that. (The managed tier is the exception: its
+address is never taken from the environment; see the managed-tier section.) A `distribution` block with settings but no `source` is legitimate when
 `KIROCREW_POLICY_URL` supplies one — the ordinary split, where the fleet publishes the cadence
 and the staleness bound while the host owns the address — and rejecting it aborted boot on
 exactly the configuration the two-channel design intends. And the migration refusal below
@@ -956,6 +1205,28 @@ flag of its own, for the reason above. It is enforced inside
 `parse_distributed_policy` as well as at the shared boot gate, so a refused document
 never reaches the cache.
 
+**A managed declaration mandates the signature without the opt-in.** When the
+`distribution` block came from the managed tier (`dist.managed`), every document that
+reaches `parse_distributed_policy` on its behalf — a fresh fetch, the cached copy on an
+outage, a cache-only child's copy — must carry a `verified` signature or it is refused,
+whatever `require_policy_signature` says. The managed document composes above the
+central rung, so a forged central document can only supply controls the fleet left
+unset; but a fleet that *delegates* its controls to the fetched document has left them
+all unset, and the opt-in lives in `admission_policy.json`, which the local account can
+write and a delegating fleet may never have set. Everything the local account controls
+on the way to that document — the cache directory under `KIROCREW_POLICY_CACHE_ONLY`,
+the TLS trust store and proxy environment on the fetch — is closed by this one rule at
+the one point every central document passes, **for an account that does not edit or
+redirect the admission trust root**: the verifying key is read from
+`admission_policy.json` (path `KIROCREW_ADMISSION_POLICY`), and an account that can
+write that file can add its own issuer. That file is the keystone the whole ceiling
+already trusts (see the signing section), so the mandate narrows the delegated case to
+the same boundary the rest of the design holds; pinning the trust root into the
+managed document is the managed-trust follow-up, not this change. A delegating fleet that has not
+provisioned a trust key fails **closed**: the central rung stays off (or boot refuses,
+per `on_unavailable`) and the managed document on disk still governs. A non-managed
+declaration keeps the opt-in semantics: that host is the operator's own.
+
 **Roll the build before the pin**, the same caveat `updates` carries: the parser fails
 closed on an unknown key, so a build predating `distribution` refuses to boot on a
 policy that declares one.
@@ -1055,9 +1326,11 @@ inventing a second scheme.
 | Piece | Where | Notes |
 |---|---|---|
 | Canonical payload | `policy_signing_payload()` | Routes through `admission.canonical_signing_bytes` — the **same** sorted-keys/compact-separators/UTF-8 canonicalization `PluginManifest.signing_payload` uses, so the two trust roots cannot drift |
-| Primitive | `admission.hmac_signature` | HMAC-SHA256 + `hmac.compare_digest`. POC symmetric; an asymmetric verify swaps in behind the same helper |
-| Trust key | admission policy `trust_keys[<issuer>]` | The **existing** operator-controlled key store — one store, not two |
+| Primitive (preferred) | `admission.ed25519_verify` | Asymmetric. The trust root holds only the **public** half, so reading it confers no ability to forge a ceiling. Key and signature are base64 (padding optional) — what the runbook's `openssl … | base64` emits; one encoding, so a hex string cannot be mistaken for base64 of a different key. Never raises: a malformed key, wrong length or failed check is one `False`, because the caller's only safe reading of "could not prove it" is "not proven" |
+| Primitive (legacy) | `admission.hmac_signature` | HMAC-SHA256 + `hmac.compare_digest`, kept so a fleet already signing with a shared secret keeps verifying byte-for-byte. Not an authenticity proof against an insider: the verifier holds the secret the signer does |
+| Trust key | admission policy `trust_public_keys[<issuer>]`, else `trust_keys[<issuer>]`, at `policy_trust_root_path()` (the `KIROCREW_ADMISSION_POLICY` override, else the data-home default) | The **existing** operator-controlled key store — one store, not two. `trust_public_keys` is checked **first**, so a fleet migrating to asymmetric signing can carry both during the rollout and have the strong proof win per issuer. A **policy** document cannot carry keys: `trust_public_keys` there is an unknown top-level key, which fails closed |
 | Opt-in | admission policy `require_policy_signature` | Separate from the plugin-facing `require_signature` |
+| Retiring the symmetric proof | delete the issuer's `trust_keys` entry | There is no fleet-wide "refuse symmetric" flag. An issuer with a public key never falls through to HMAC; an issuer with only an HMAC key reads `unverified` the moment its key is removed — per issuer, same file, same verdict a flag would have produced. A second spelling of key deletion was shipped and withdrawn in review |
 | Verdict | `GovernanceCeiling.signature_state` | `verified` / `unverified` / `unsigned` / `unchecked` |
 
 **Coverage** is the whole document minus `identity.signature` (a signature cannot
@@ -1075,8 +1348,9 @@ break a signature while changing any value or key does.
 has to be authentic. A `require_signature` flag inside the security policy would
 be self-referential — an attacker rewriting the policy would simply clear it. The
 admission policy is already this package's fleet-controlled trust root, already
-carries `trust_keys`, and is already on the `is_sensitive_path` keystone, so the
-governance trust root inherits every protection the plugin trust root has.
+carries `trust_public_keys` / `trust_keys`, and is already on the
+`is_sensitive_path` keystone, so the governance trust root inherits every protection
+the plugin trust root has.
 `_policy_trust_settings()` reads through **`admission.read_policy_trust_root()`**,
 a deliberately side-effect-free reader — *not* `load_admission_policy`, which
 records the dashboard admission posture and emits a **critical**
@@ -1099,11 +1373,53 @@ raises `PlatformCompositionError` and **aborts boot** (plus a `failed_closed`
 governance-health mark), matching the module's existing fail-closed discipline for
 a wrong version, a missing `boot` object, or an unknown governed key.
 
-**All three tiers are verified — none is exempt.** When `require_policy_signature`
-is OFF (the default, and what the `amazon` edition ships), verification is advisory
-at every tier: an unsigned policy — bundled or on disk — still loads and still
-governs, so existing installs are unchanged. When it is ON, every tier must present
-a signature that verifies against a trust key, or boot aborts.
+**Every tier's document is checked; the gate judges the final ceiling.** All five
+documents — the managed profile, the fetched document, the env path, the companion
+bundle and the operator home file — are verified as they are read, and each parsed
+ceiling carries its own `signature_state`. Enforcement is a separate step:
+`assert_policy_signature_satisfied` runs once on the **final composed ceiling**, whose
+`signature_state` is the **authority's** (`_intersect_ceilings` keeps everything outside
+`controls` with the authority). So a subordinate that only tightens is composed in
+without its own signature having to verify; what must verify is the document that
+governs. When `require_policy_signature` is OFF (the default, and what the `amazon`
+edition ships) the verdict is advisory and an unsigned policy still governs, so existing
+installs keep working with no key to provision. When it is ON, the final ceiling must
+carry a verifying signature or boot aborts. A fleet that no longer wants a symmetric
+HMAC verdict to count deletes that issuer's `trust_keys` entry; there is no separate
+flag for it.
+
+**Malformed gate flags fail closed.** `require_signature` and
+`require_policy_signature` are security requirements, so a present-but-not-boolean
+value (`"true"`, `1`) reads as **ON** with a warning naming the key — a typo that
+switched a gate off would admit an unsigned plugin. An explicit JSON `null` is a
+present-but-not-boolean value and reads the same way; only an absent key takes the
+default (`_MISSING` sentinel in `AdmissionPolicy.from_dict`). Every flag the
+constructor reads is a gate, so every call site takes the fail-closed direction.
+
+The **managed** tier is verified like any other, and the signature is doing
+different work there: file ownership already proves a standard user did not write
+it, while the signature proves the **issuer** authored the bytes — so a compromised
+MDM channel, or a document swapped in transit before the MDM wrote it, is still
+tamper-evident.
+
+**The key does not ride in the configuration profile that carries the ceiling.** The
+trust root is `admission_policy.json` — or the file `KIROCREW_ADMISSION_POLICY` names —
+and there is no second channel: `parse_policy` fails closed on an unknown top-level
+key, so a policy document carrying `trust_public_keys` is **refused**, not read. The
+key is placed per host, by whatever config management places the managed profile (see
+[the operator guide](../../guides/enterprise-mcp-governance.md#signing-with-a-public-key-you-publish)).
+
+**And that bounds what a signature proves.** The trust root is a user-owned file in the
+data home, redirectable by an environment variable, so a standard user on the host can
+clear `require_policy_signature` or add a `trust_keys` entry — in place, or
+by pointing `KIROCREW_ADMISSION_POLICY` at a different file. Signing therefore
+binds a user who does not edit their own trust root: it makes a fleet-pushed ceiling
+tamper-**evident** to the host that loads it, and it does not make the requirement
+unclearable on that host. Protecting the trust root is a separate change of comparable
+size and is **not** part of this one. What the reader does get is that
+`require_policy_signature` demands a real JSON boolean (`_coerce_flag`): the string
+`"false"` is not coerced by `bool()` — which would read it as `True` — but reported
+with a WARNING and resolved in the gate's fail-closed direction.
 
 The companion-bundled tier is **not** exempt: the plugin-admission manifest
 signature covers only the manifest fields (`name` / `publisher` / `version` /
@@ -1126,9 +1442,9 @@ on the **final composed context** alongside the other governance floor gates. It
 rejects both failure shapes: a surviving ceiling whose state is not `verified`, and
 no ceiling at all.
 
-The split is what makes tier precedence work. `load_security_policy` walks
-env → companion bundle → operator home and runs more than once per boot with
-different arguments — the core calls it with no `bundled_loader`, a companion
+The split is what makes tier precedence work. `load_security_policy` composes
+managed → central → subordinate (env / companion bundle / operator home) and runs
+more than once per boot with different arguments — the core calls it with no `bundled_loader`, a companion
 edition re-invokes it with one. A raise inside the loader fires on whichever tier
 that particular pass happened to reach, so an enterprise host with an unsigned home
 file and a correctly signed companion bundle aborted on the *lower-precedence* tier
@@ -1168,9 +1484,19 @@ confinement boundary for a local process running as the operator — such a proc
 can edit the admission policy (clearing the opt-in) as easily as the security
 policy. The `is_sensitive_path` keystone remains the control that stops the
 *agent* from reaching either file; signing is what makes a fleet-pushed ceiling
-tamper-**evident** to the host that loads it. Symmetric HMAC also means the
-verifier holds a secret capable of *producing* signatures, so key distribution is
-the residual weakness an asymmetric successor removes.
+tamper-**evident** to the host that loads it.
+
+`trust_public_keys` closes the key-distribution weakness the symmetric primitive
+had — the verifying host no longer holds anything that can *produce* a signature —
+and deleting an issuer's `trust_keys` entry is how a fleet refuses to accept the weaker
+proof at all. What remains, and is stated plainly rather than papered over: **none of
+this binds a user with local root.** Such a user can rewrite the managed file, clear
+the opt-in in `admission_policy.json`, or edit the installed Python, and the wheel
+installs readable `.py` files either way. What the model does buy is that a standard
+user cannot loosen the ceiling **at all**, and an admin's tampering with the managed
+file is reverted by the MDM on its next check-in and left in the audit trail.
+Binding root requires server-side attestation, which is out of scope here — step 7 of
+[the RFC](../../request-for-change/rfc-central-governance-ceiling.md).
 
 `kirocrew policy show` prints the verdict verbatim
 (`GovernanceCeiling.signature_summary()`) so an operator can tell an established
@@ -2919,7 +3245,7 @@ which are gone.)
 ## Companion (separate package, separate CR)
 
 The `amazon` companion contributes the restrictive posture as its
-**bundled `security_policy.json`** (precedence step 2) rather than as code;
+**bundled `security_policy.json`** (precedence step 4) rather than as code;
 capability providers (Midway/SigV4/tunnels) and the SharePoint redaction
 carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 
@@ -2928,17 +3254,26 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 - `platform/governance.py` — archetypes, catalog, loader, evaluator
   (`resolve`, `resolve_ordinal`, `gate_decision`, `assert_governance_floor`,
   `compose_profiles`, `resolve_pinned_commands` + `COMMANDS_SCOPE` force-pins,
-  `policy_signing_payload` + the `identity.signature` verification path).
-- `platform/admission.py` — `canonical_signing_bytes` / `hmac_signature` (shared
-  by both trust roots), `require_policy_signature` / `trust_keys`, and
-  `read_policy_trust_root` (the side-effect-free trust-root reader).
+  `policy_signing_payload` + the `identity.signature` verification path), the
+  five-tier ladder (`TIER_MANAGED` … `TIER_HOME`, `_managed_policy_path` —
+  macOS/Linux only, `None` elsewhere — `_assert_managed_file_trusted`,
+  `_read_managed_policy`, `_intersect_ceilings`, `_audit_policy_tier`), the single
+  precedence fold `compose_tier_ladder` with its refresh entry point
+  `compose_installed_ceiling` (+ `_TierProcessState`, the per-process tier state:
+  the remembered bundled tier and the two once-per-process latches).
+- `platform/admission.py` — `canonical_signing_bytes` (shared by both trust roots),
+  `ed25519_verify` (the asymmetric primitive) and the legacy `hmac_signature`,
+  `require_policy_signature` / `trust_public_keys` / `trust_keys`, and
+  `read_policy_trust_root` (the
+  side-effect-free trust-root reader).
 - `platform/update_governance.py` — the shared update seam (`resolve_remote_url`,
   `update_blocked_reason`, `update_required`, `min_version`) called by
   `dashboard/handlers/updates.py`, `cli_server.py` and `slack/gateway.py`.
 - `platform/policy_distribution.py` — central distribution: source resolution
   (env ∘ the policy's `distribution` block), the append-only
-  `register_policy_fetcher` transport seam, the last-known-good cache, and the
-  `refresh_now` / `apply_ceiling` / `start_refresher` live-refresh path.
+  `register_policy_fetcher` transport seam, the last-known-good cache, the
+  `refresh_now` / `validate_ceiling` / `apply_ceiling` / `start_refresher`
+  live-refresh path.
 - `platform/governance_profiles.py` — `ProfileStore` (hot-reload),
   `resolve_active_scope`, `governance_permits`, `governance_floor_ordinal`,
   `GOVERNANCE_ERROR_REASON` (the eval-error marker consumers match on),
@@ -2975,8 +3310,14 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 
 `test_governance_policy.py` (archetypes + loader + evaluator + E1–E13 vectors +
 extensibility + the `identity.signature` states, the opt-in fail-closed gate, and
-the `policy show` provenance reporting), `test_platform_admission.py`
-(`require_policy_signature` / shared signing primitives),
+the `policy show` provenance reporting),
+`test_governance_managed_tier.py` (the managed tier: that it outranks the central
+document and every local one, that a lower tier can only tighten it, the
+trust checks — non-root owner, group/world write, symlink, non-regular file,
+oversize — each failing closed rather than falling through, the inert-when-absent
+contract),
+`test_platform_admission.py`
+(`require_policy_signature` / `ed25519_verify` / shared signing primitives),
 `test_governance_boot.py` (compose at boot), 
 `test_governance_self_protection.py` (keystone), `test_governance_profiles.py`
 (resolution + binding + hot-reload + fail-closed reload dispositions),
@@ -2989,7 +3330,7 @@ the per-transport inbound gates), `test_governance_channels_endpoint.py`
 host-profile pin is reported as surface-scoped, not install-wide),
 `test_governance_distribution.py` (the `distribution` block, the fetcher seam and
 its transport refusals, the cache and its repoint/staleness rules, the
-unavailable dispositions, the live-refresh reject-and-keep path, and the three
+unavailable dispositions, the live-refresh reject-and-keep path — and the three
 controls on the cache itself — `TestAnExposedCacheIsStillReadOnly`,
 `TestTheCachePairIsWrittenUnderOneLock` and
 `TestAnUnverifiableSourceIsTreatedAsWritable`),

@@ -83,9 +83,12 @@ class TestApiKiroHooks:
     @pytest.mark.asyncio
     async def test_missing_defaults_file(self, kiro_dir: Path, tmp_path: Path) -> None:
         """Path 2: _shipped_defaults() points to non-existent file → all tagged 'user'."""
-        _write_agent_cfg(kiro_dir, {
-            "hooks": {"preToolUse": [{"command": "echo hi", "matcher": ""}]},
-        })
+        _write_agent_cfg(
+            kiro_dir,
+            {
+                "hooks": {"preToolUse": [{"command": "echo hi", "matcher": ""}]},
+            },
+        )
         missing = tmp_path / "no_such_defaults.json"
         with patch(_P_AGENTS_DIR, kiro_dir), patch(_P_DEFAULTS, return_value=missing):
             async with TestClient(TestServer(_make_app())) as client:
@@ -110,12 +113,15 @@ class TestApiKiroHooks:
     @pytest.mark.asyncio
     async def test_unknown_events_dropped(self, kiro_dir: Path, tmp_path: Path) -> None:
         """Path 4: Events not in _VALID_HOOK_EVENTS are filtered out."""
-        _write_agent_cfg(kiro_dir, {
-            "hooks": {
-                "preToolUse": [{"command": "echo valid"}],
-                "evilInjectedEvent": [{"command": "echo bad"}],
+        _write_agent_cfg(
+            kiro_dir,
+            {
+                "hooks": {
+                    "preToolUse": [{"command": "echo valid"}],
+                    "evilInjectedEvent": [{"command": "echo bad"}],
+                },
             },
-        })
+        )
         defaults = tmp_path / "defaults.json"
         _write_defaults(defaults, {"hooks": {}})
         with patch(_P_AGENTS_DIR, kiro_dir), patch(_P_DEFAULTS, return_value=defaults):
@@ -129,9 +135,12 @@ class TestApiKiroHooks:
     @pytest.mark.asyncio
     async def test_redaction_applied(self, kiro_dir: Path, tmp_path: Path) -> None:
         """Path 5: redact() is called on command and matcher values."""
-        _write_agent_cfg(kiro_dir, {
-            "hooks": {"postToolUse": [{"command": "echo secret", "matcher": "tool_*"}]},
-        })
+        _write_agent_cfg(
+            kiro_dir,
+            {
+                "hooks": {"postToolUse": [{"command": "echo secret", "matcher": "tool_*"}]},
+            },
+        )
         defaults = tmp_path / "defaults.json"
         _write_defaults(defaults, {"hooks": {}})
         with (
@@ -145,25 +154,41 @@ class TestApiKiroHooks:
                 entry = (await resp.json())["hooks"]["postToolUse"][0]
                 assert entry["command"] == "[R:echo secret]"
                 assert entry["matcher"] == "[R:tool_*]"
-                assert mock_redact.call_count == 2
+                # Count the HANDLER's calls, not every call in the process. The patch
+                # target is the process-wide ``security.redact``, and the SEL routes
+                # every field it persists through the same function -- so any audit row
+                # written while the platform context composes on first use (for
+                # example the managed-tier absence record on a standalone host) would
+                # otherwise be counted against this handler and make the test assert
+                # on unrelated subsystems.
+                own = [
+                    c for c in mock_redact.call_args_list if c.args[0] in ("echo secret", "tool_*")
+                ]
+                assert len(own) == 2
 
     @pytest.mark.asyncio
     async def test_bundled_vs_user_tagging(self, kiro_dir: Path, tmp_path: Path) -> None:
         """Hooks matching bundled defaults tagged 'bundled', others 'user'."""
         bundled_cmd = "aim agents publish-metrics || true"
         user_cmd = "echo custom"
-        _write_agent_cfg(kiro_dir, {
-            "hooks": {
-                "userPromptSubmit": [
-                    {"command": bundled_cmd, "matcher": ""},
-                    {"command": user_cmd, "matcher": ""},
-                ],
+        _write_agent_cfg(
+            kiro_dir,
+            {
+                "hooks": {
+                    "userPromptSubmit": [
+                        {"command": bundled_cmd, "matcher": ""},
+                        {"command": user_cmd, "matcher": ""},
+                    ],
+                },
             },
-        })
+        )
         defaults = tmp_path / "defaults.json"
-        _write_defaults(defaults, {
-            "hooks": {"userPromptSubmit": [{"command": bundled_cmd, "matcher": ""}]},
-        })
+        _write_defaults(
+            defaults,
+            {
+                "hooks": {"userPromptSubmit": [{"command": bundled_cmd, "matcher": ""}]},
+            },
+        )
         with patch(_P_AGENTS_DIR, kiro_dir), patch(_P_DEFAULTS, return_value=defaults):
             async with TestClient(TestServer(_make_app())) as client:
                 resp = await client.get("/api/kiro-hooks")
@@ -175,9 +200,12 @@ class TestApiKiroHooks:
     @pytest.mark.asyncio
     async def test_non_dict_entries_skipped(self, kiro_dir: Path, tmp_path: Path) -> None:
         """Non-dict entries in hook arrays are silently skipped."""
-        _write_agent_cfg(kiro_dir, {
-            "hooks": {"preToolUse": ["not-a-dict", 42, {"command": "echo ok"}]},
-        })
+        _write_agent_cfg(
+            kiro_dir,
+            {
+                "hooks": {"preToolUse": ["not-a-dict", 42, {"command": "echo ok"}]},
+            },
+        )
         defaults = tmp_path / "defaults.json"
         _write_defaults(defaults, {"hooks": {}})
         with patch(_P_AGENTS_DIR, kiro_dir), patch(_P_DEFAULTS, return_value=defaults):

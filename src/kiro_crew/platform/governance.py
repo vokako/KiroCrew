@@ -41,7 +41,9 @@ import json
 import logging
 import math
 import os
+import plistlib
 import re
+import stat
 import threading
 import urllib.parse
 from dataclasses import dataclass, field, replace
@@ -58,11 +60,12 @@ from typing import (
     runtime_checkable,
 )
 
+from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 from kiro_crew.platform.admission import (
     canonical_signing_bytes,
+    ed25519_verify,
     hmac_signature,
-    policy_trust_root_path,
     read_policy_trust_root,
 )
 from kiro_crew.platform.context import PlatformCompositionError
@@ -79,6 +82,52 @@ logger = logging.getLogger(__name__)
 # caller that knows the active edition (see ``load_security_policy``).
 _POLICY_ENV = "KIROCREW_SECURITY_POLICY"
 _POLICY_HOME_LEAF = "security_policy.json"
+
+# Names for the precedence tiers.  Set by the loader on the ceiling each tier
+# produces and written into SEL audit records (``_audit_policy_tier``); strings
+# rather than an enum because a SEL record is text.
+TIER_MANAGED = "managed"  # MDM configuration profile — root-owned, highest
+TIER_CENTRAL = "central"  # the fetched, centrally distributed document
+TIER_ENV = "env"  # KIROCREW_SECURITY_POLICY
+TIER_BUNDLED = "bundled"  # the companion edition's packaged resource
+TIER_HOME = "home"  # ~/.kiro/crew/security_policy.json
+
+
+# The MDM-managed configuration profile.  This is the ONE channel a standard user
+# cannot write, which is the entire reason it outranks every other tier: an
+# environment variable is per-process and redefinable by whoever launches the
+# process, so MDM can *set* one but never *pin* one.  A configuration profile
+# instead lands as a root-owned file the MDM re-asserts on every check-in, so a
+# local edit is reverted rather than honoured.
+#
+# Reverse-DNS domain matches ``service.common.LAUNCHD_LABEL``'s namespace
+# (``dev.kirocrew.*``) so an admin authors ONE preference domain per product.
+_MANAGED_POLICY_DOMAIN = "dev.kirocrew"
+_MANAGED_POLICY_MACOS = Path("/Library/Managed Preferences") / f"{_MANAGED_POLICY_DOMAIN}.plist"
+#: Linux has no managed-preferences domain, so the equivalent is a root-owned path
+#: under ``/etc`` that configuration management (Ansible, Puppet, Intune for Linux)
+#: owns.  Same trust property: not writable by the user the agent runs as.
+#:
+#: A SIBLING of ``/etc/kirocrew``, never inside it.  ``service.linux.ENV_DIR`` is
+#: ``/etc/kirocrew`` and the service installer creates it; on a hardened image
+#: (umask 027 / 077) that directory can come out ``0750`` or ``0700`` ``root:root``,
+#: and then opening a file that does not exist beneath it returns EACCES, not ENOENT.
+#: ``_read_managed_policy`` fails closed on every error but ENOENT -- correctly, for a
+#: directory this tier owns -- so sharing the installer's directory turned "installed
+#: the service on a CIS image" into "the gateway refuses to boot on a host no fleet
+#: ever provisioned".  A directory nothing else creates cannot be misread that way,
+#: and ``test_the_managed_path_is_not_under_the_service_env_dir`` pins the split.
+_MANAGED_POLICY_LINUX = Path("/etc/kirocrew-managed/security_policy.json")
+#: Windows has NO managed tier yet -- see ``_managed_policy_path``.  There is
+#: deliberately no path constant here, because naming one is what tempted the first
+#: implementation into resolving it from the ``ProgramData`` environment variable.
+#: A managed document is a ceiling, not a payload; 1 MiB is orders of magnitude
+#: above any real policy and bounds a mistake rather than an intention.
+_MANAGED_POLICY_MAX_BYTES = 1024 * 1024
+
+#: Group- and world-writable bits.  A managed file carrying either is not managed:
+#: anyone in the group could rewrite the fleet ceiling.
+_GROUP_WORLD_WRITE = 0o022
 
 # Duplicated from ``policy_distribution.POLICY_URL_ENV`` on purpose.  This module
 # is the trust root and must not import the fetch engine at module load — that
@@ -186,8 +235,8 @@ def _match_path(item: str, pattern: str) -> bool:
     and avoids one trap:
 
     * a ``..`` traversal cannot satisfy an ALLOW-mode prefix:
-      ``/home/u/ws/../.bashrc`` normalizes to ``/home/u/.bashrc`` and no longer
-      fnmatches ``/home/u/ws/**`` (without this ``*`` spans the ``..`` and the
+      ``/home/u/ws/../.bashrc`` normalizes to ``/home/u/.bashrc`` and does not
+      fnmatch ``/home/u/ws/**`` (without this ``*`` spans the ``..`` and the
       write is wrongly PERMITTED though the OS resolves it outside the allow-list);
     * an agent-supplied RELATIVE item is anchored to an absolute form, so it can
       still match an absolute DENY glob (``../../etc/passwd`` cannot dodge
@@ -1101,8 +1150,8 @@ class ScopeSpec:
 # validate`` reports a partially-governed ``capabilities`` block so the gap is
 # visible instead of implied.
 #
-# Verified 2026-08-11 by executing parse_policy + resolve; several comments below
-# previously described the absent-key case and were wrong.
+# The absent-key semantics below are verified by executing parse_policy + resolve,
+# not inferred from the comments.
 
 # Built-in catalog.
 #
@@ -1169,7 +1218,7 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # not governable. This row answers "what may THIS DEPLOYMENT select", so a
     # managed fleet can qualify one harness and bound the rest.
     #
-    # ADDITIVE over a floor, which is the semantics decision #6622 was blocked on:
+    # ADDITIVE over a floor -- the semantics the selectable-backend design settled on:
     #   {"agent_backend": {"mode": "allow", "allow": ["claude"]}}
     # means "ALSO allow claude", not "only claude" — ``kiro`` stays selectable
     # because ``acp_backends.GOVERNANCE_FLOOR_BACKEND`` is never submitted to this
@@ -1632,11 +1681,37 @@ class PolicyDistribution:
     #: incident — for a fleet that would rather have a working host it can see is
     #: degraded than a host that will not start.
     on_unavailable: str = UNAVAILABLE_FAIL_CLOSED
+    #: True when this declaration came from the MDM-managed tier. Not parsed from any
+    #: document -- ``from_dict`` never sets it, deliberately, because a document that
+    #: could claim to be managed would be claiming its own un-overridability. Only the
+    #: loader, which knows which tier it read, marks it. ``resolve_distribution``
+    #: refuses non-credential environment overrides when it is set: the managed tier's
+    #: guarantee is that a local account cannot choose the fleet's ceiling, and a
+    #: redirectable source would hand exactly that choice back.
+    managed: bool = False
 
     @property
     def enabled(self) -> bool:
         """Is central distribution configured at all?"""
         return bool(self.source)
+
+    @property
+    def declared(self) -> bool:
+        """Did the tier that produced this value express distribution AT ALL?
+
+        Distinct from :attr:`enabled`, which asks only whether a source is set.  A
+        managed ``distribution: {}`` declares that the fleet owns the channel while
+        naming no address; the ladder must treat that as decisive (no lower tier and
+        no environment variable may supply the source -- the central tier simply
+        stays off until the fleet names one), so "declared something" and "declared a
+        source" are different questions and the ladder needs the first one.  A
+        non-managed tier may still pair a source-less block with
+        ``KIROCREW_POLICY_URL``; that is the operator's own host.
+
+        Defined as "differs from the default", so a field added to this dataclass
+        later is covered without editing a hand-maintained list.
+        """
+        return self != PolicyDistribution()
 
     def effective_timeout(self) -> float:
         return self.timeout_secs if self.timeout_secs > 0 else DEFAULT_FETCH_TIMEOUT_SECS
@@ -1659,7 +1734,21 @@ class PolicyDistribution:
         return age_secs > self.max_cache_age_secs
 
     @staticmethod
-    def from_dict(d: Mapping[str, object]) -> "PolicyDistribution":
+    def from_dict(d: Mapping[str, object], *, managed: bool = False) -> "PolicyDistribution":
+        """Parse a ``distribution`` block.
+
+        *managed* says the block came from the MDM-managed tier, and changes ONE rule:
+        settings without a ``source``. On a subordinate tier that shape is refused
+        (below), because the document delegates its controls to a fetched one and a
+        host that never fetches is ungoverned while its file reads as managed. On the
+        managed tier the managed document IS the ceiling, so central-off leaves the
+        host fully governed by it; refusing there turned a plausible MDM authoring
+        mistake (pin the cadence, forget the address) into a fleet-wide boot abort,
+        which the guide had already promised would not happen. The block is kept for
+        its settings, central stays off, and a warning plus an audit row say so. The
+        environment is never consulted for the address on the managed tier -- that is
+        the local account's channel, and the managed pin exists to refuse it.
+        """
         _reject_unknown_keys(
             d,
             {
@@ -1783,17 +1872,23 @@ class PolicyDistribution:
                     f"{sorted(_UNAVAILABLE_DISPOSITIONS)}"
                 )
 
-        if (
-            not source
-            and not os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip()
-            and any(
-                (
-                    numbers["refresh_interval_secs"],
-                    numbers["timeout_secs"],
-                    numbers["max_cache_age_secs"],
-                    raw_disposition is not None,
-                )
+        settings_without_source = not source and any(
+            (
+                numbers["refresh_interval_secs"],
+                numbers["timeout_secs"],
+                numbers["max_cache_age_secs"],
+                raw_disposition is not None,
             )
+        )
+        if settings_without_source and managed:
+            # The managed document is itself the ceiling, so a fleet that pinned the
+            # cadence and named no address has a governed host with central OFF -- not
+            # an ungoverned one. Refusing here aborted boot on every host in that fleet
+            # for an authoring slip the guide promised would not stop the host. Say so
+            # instead; the fleet sees the row and names the source.
+            _warn_managed_distribution_sourceless_once()
+        elif (
+            settings_without_source and not os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip()
         ):
             # A block that tunes a fetch it never configures is a policy whose
             # author believed central distribution was on. Silently ignoring it is
@@ -1889,6 +1984,11 @@ class GovernanceCeiling:
     # Empty when omitted — runtime then uses env or a later default. A profile
     # cannot carry this key. Read through :func:`agentcore_workload_name`.
     agentcore_workload_name: str = ""
+    # Which precedence tier produced this ceiling (one of the ``TIER_*`` names, or
+    # "" for a ceiling parsed outside the loader).  Its one consumer is the tier
+    # audit in ``compose_tier_ladder``, which names authority and subordinate in the
+    # SEL when two tiers compose; nothing displays it to an operator yet.
+    tier: str = ""
 
     def get(self, scope: str) -> Optional[object]:
         return self.controls.get(scope)
@@ -2458,12 +2558,19 @@ def _parse_controls(
 # Loader
 # ──────────────────────────────────────────────────────────────────────────
 def parse_policy(
-    data: Mapping[str, object], *, signature_state: str = SIGNATURE_UNCHECKED
+    data: Mapping[str, object],
+    *,
+    signature_state: str = SIGNATURE_UNCHECKED,
+    managed: bool = False,
 ) -> GovernanceCeiling:
     """Parse a policy mapping into a frozen ``GovernanceCeiling``.
 
     Fails closed (raises ``PlatformCompositionError``) on any structural problem
     so a malformed-but-present policy never silently degrades to ungoverned.
+
+    ``managed`` is set only by :func:`_managed_ceiling`; it reaches
+    :meth:`PolicyDistribution.from_dict`, where it is the one rule that differs
+    between a document that IS the ceiling and one that delegates to a fetched one.
 
     ``signature_state`` is supplied by :func:`load_security_policy`, which is the
     only caller that has the trust root.  It defaults to ``SIGNATURE_UNCHECKED``
@@ -2533,7 +2640,7 @@ def parse_policy(
         identity_signature=signature,
         signature_state=signature_state,
         updates=UpdatePins.from_dict(raw_updates or {}),
-        distribution=PolicyDistribution.from_dict(raw_distribution or {}),
+        distribution=PolicyDistribution.from_dict(raw_distribution or {}, managed=managed),
         fallback_profile=fallback_profile,
         agentcore_identity_posture=composed_posture,
         agentcore_gateway_url=composed_gateway_url,
@@ -2665,9 +2772,20 @@ def policy_signing_payload(data: Mapping[str, object]) -> bytes:
 
 
 def _policy_signature_state(
-    data: Mapping[str, object], trust_keys: Mapping[str, str]
+    data: Mapping[str, object],
+    trust_keys: Mapping[str, str],
+    *,
+    public_keys: Optional[Mapping[str, str]] = None,
 ) -> Tuple[str, str]:
     """Classify a policy document's signature.  Returns ``(state, detail)``.
+
+    ``public_keys`` is keyword-only with an inert default so every existing
+    two-argument caller keeps its exact behaviour.  An issuer listed there is judged
+    by its Ed25519 key and never falls through to ``trust_keys``; an issuer listed
+    only in ``trust_keys`` is judged by HMAC.  A fleet that wants to stop accepting
+    symmetric proofs deletes the issuer's ``trust_keys`` entry -- the same
+    operator-owned file, per issuer, yielding the same ``UNVERIFIED`` -- so there is
+    no separate fleet-wide switch for it.
 
     Pure and I/O-free: the caller supplies the trust keys, so this is directly
     unit-testable and the loader keeps the single responsibility of deciding what
@@ -2684,6 +2802,18 @@ def _policy_signature_state(
     if not issuer:
         # A signature with no issuer names no key, so nothing can verify it.
         return SIGNATURE_UNVERIFIED, "identity.signature present but identity.issuer is empty"
+    # ASYMMETRIC FIRST.  An issuer with a public key is verified against it and
+    # never falls back to a shared secret: a fleet mid-migration carries both maps,
+    # and silently accepting the weaker proof when the strong one fails would make
+    # the migration meaningless.
+    public_key = (public_keys or {}).get(issuer)
+    if public_key:
+        if ed25519_verify(public_key, policy_signing_payload(data), signature):
+            return SIGNATURE_VERIFIED, f"issuer {issuer!r} (ed25519)"
+        return (
+            SIGNATURE_UNVERIFIED,
+            f"asymmetric signature does not match the public key for issuer {issuer!r}",
+        )
     secret = trust_keys.get(issuer)
     if not secret:
         return SIGNATURE_UNVERIFIED, f"no trust key for issuer {issuer!r}"
@@ -2739,15 +2869,41 @@ def _policy_trust_settings() -> Tuple[bool, Dict[str, str]]:
         return False, {}
 
 
+def _policy_asymmetric_settings() -> Dict[str, str]:
+    """Read ``trust_public_keys`` from the admission trust root.
+
+    Split from :func:`_policy_trust_settings` rather than widening its return
+    tuple because that function's two-value shape is asserted directly by the
+    existing suite, and a trust root is not the place to take a compatibility
+    risk for tidiness.  Same source, same never-raises contract, same reasoning
+    about why the keys live in the admission policy.
+    """
+    try:
+        adm = read_policy_trust_root()
+        return dict(adm.trust_public_keys)
+    except Exception:
+        logger.debug("policy asymmetric trust settings unavailable", exc_info=True)
+        return {}
+
+
 def _policy_signature_required() -> bool:
     """True when the admission policy explicitly opted in.
+
+    Reads the flag through ``read_policy_trust_root`` -- the SAME strict parse the
+    ``AdmissionPolicy`` constructor applies -- rather than re-opening the file and
+    calling ``bool()`` on the raw value.  An earlier revision did the raw read here,
+    which meant the constructor's rule (a present-but-not-boolean value such as an
+    explicit ``null`` or ``"true"`` fails CLOSED) never reached either gate that
+    consumes this function: boot (``assert_policy_signature_satisfied``) and the
+    fetch refusal in ``policy_distribution`` both read ``bool(None)`` and admitted an
+    unsigned ceiling on a template-rendered ``null``.  One reader, one rule.
 
     A trust root that is absent, unreadable, or not a JSON object reads as **no
     opt-in**, and that is deliberate rather than a gap.  An attacker who can write
     ``admission_policy.json`` is explicitly out of this feature's threat model (see
     the threat-model note in ``docs/system-specs/modules/governance.md``) — such a
     process would simply set the flag to ``false``, which is well-formed JSON, so
-    fail-closing on a *malformed* file only catches a clumsy version of an attack
+    fail-closing on an *unparseable* file only catches a clumsy version of an attack
     the design already concedes.  What a corrupt trust root actually indicates in
     practice is a non-atomic fleet push or a hand-edit typo — a reliability event —
     and the useful response to that is to log loudly and behave predictably, which
@@ -2756,10 +2912,10 @@ def _policy_signature_required() -> bool:
     Never raises.
     """
     try:
-        data = json.loads(policy_trust_root_path().read_text(encoding="utf-8"))
+        return bool(read_policy_trust_root().require_policy_signature)
     except Exception:
+        logger.debug("policy trust root unavailable for the signature gate", exc_info=True)
         return False
-    return bool(isinstance(data, dict) and data.get("require_policy_signature", False))
 
 
 def _audit_policy_signature(state: str, detail: str, path_label: str) -> None:
@@ -2819,7 +2975,8 @@ def _verify_policy_signature(data: Mapping[str, object], *, source: str) -> str:
     Returns the state to record on the ceiling.  Never raises.
     """
     _, trust_keys = _policy_trust_settings()
-    state, detail = _policy_signature_state(data, trust_keys)
+    public_keys = _policy_asymmetric_settings()
+    state, detail = _policy_signature_state(data, trust_keys, public_keys=public_keys)
     _audit_policy_signature(state, detail, source)
     return state
 
@@ -2833,99 +2990,1004 @@ def _mark_policy_signature_incident(detail: str) -> None:
         logger.debug("governance health mark unavailable", exc_info=True)
 
 
+@dataclass
+class _TierProcessState:
+    """Every per-process value the tier ladder keeps, in ONE place.
+
+    ``load_security_policy`` is not called once per process -- ``mcp_gateway.app_call``
+    re-runs it on every app callback -- so anything that must happen once, or be
+    remembered across a central refresh, lives here rather than being recomputed.
+    Held in one dataclass rather than four module globals so a test resets them
+    together (:func:`reset_process_state`, mirroring
+    ``policy_distribution.reset_process_state``): a fixture that reset three of four
+    globals and forgot the fourth is how ``last_bundled`` leaked between tests.
+
+    ``last_bundled`` -- the companion edition's bundled document from the last load
+    that resolved one. A refresh has no ``bundled_loader`` of its own, and without
+    this the bundled rung would drop out of the ladder at the first poll, loosening a
+    ceiling an edition tightened. The packaged resource is static for the process.
+
+    ``absence_audited`` -- the managed tier's absence has been recorded. Once per
+    process: a standalone host would otherwise append one SEL row per callback for a
+    fact that never changes.
+
+    ``env_beneath_central_warned`` -- the one-time warning that
+    ``KIROCREW_SECURITY_POLICY`` only tightens has fired. A runbook may still describe
+    it as a rollback lever that outranks the central document; the first compose of
+    the env-beneath-authority shape says otherwise, once.
+
+    ``tier_intersects_audited`` -- the ``(authority, lower)`` pairs already recorded.
+    The pairs are fixed for the process unless a tier appears or disappears, so a row
+    per compose was a row per interaction, burying the one-time signals above.
+
+    ``managed_sourceless_warned`` -- the managed document's ``distribution`` block
+    tunes a fetch it never names, and that has been reported.  Detected in a parser
+    the loader and every refresh re-run; see
+    :func:`_warn_managed_distribution_sourceless_once`.
+
+    ``last_composed`` -- the fold now IN EFFECT: what :func:`load_security_policy`
+    returned at boot, or what :func:`policy_distribution.apply_ceiling` installed on a
+    refresh (recorded after ``set_context``, never for a fold that failed
+    validation).  It is the comparison basis for the 304 re-fold
+    (``policy_distribution._recompose_differs``): "did another tier move" is a
+    question about the fold, and the fold is the only object this module can vouch
+    for.  ``current_context().governance`` is NOT that object -- whatever installed it
+    (``bootstrap``, the companion's ``compose``, a caller that ``replace()``-tags a
+    field) may have made it structurally unequal to the fold while meaning the same
+    ceiling, and a compare against it would re-install on every quiet poll and bump
+    the governance generation each time.  Read it through
+    :func:`last_composed_ceiling`.
+    """
+
+    last_bundled: Optional[Mapping[str, object]] = None
+    absence_audited: bool = False
+    env_beneath_central_warned: bool = False
+    tier_intersects_audited: "set[Tuple[str, str]]" = field(default_factory=set)
+    managed_sourceless_warned: bool = False
+    last_composed: Optional["GovernanceCeiling"] = None
+
+
+_process_state = _TierProcessState()
+
+
+def reset_process_state() -> None:
+    """Clear every per-process value the tier ladder keeps.  Test helper."""
+    global _process_state
+    _process_state = _TierProcessState()
+
+
+def last_composed_ceiling() -> Optional["GovernanceCeiling"]:
+    """The last fold that actually LANDED, or ``None`` before the first one.
+
+    "Landed" is the load-bearing word: :func:`load_security_policy` records its
+    result (a boot whose fold fails the floor gates aborts the process, so that record
+    cannot outlive a rejection), and :func:`policy_distribution.apply_ceiling` records
+    only after ``set_context`` returns. :func:`compose_installed_ceiling` itself records
+    nothing, because its caller may reject the fold.  See ``_TierProcessState``.
+    """
+    return _process_state.last_composed
+
+
+def record_composed_ceiling(ceiling: "GovernanceCeiling") -> None:
+    """Record *ceiling* as the fold now in effect.  Installer-only; see above."""
+    _process_state.last_composed = ceiling
+
+
+def _warn_managed_distribution_sourceless_once() -> None:
+    """Report a managed ``distribution`` block that tunes a fetch it never names.
+
+    Once per process, behind ``_TierProcessState.managed_sourceless_warned``.  The
+    parse that detects the slip (``PolicyDistribution.from_dict(managed=True)``) is
+    not a once-per-boot event: ``load_security_policy`` reaches it twice per call (the
+    ``_declared_distribution`` peek and the ``_managed_ceiling`` parse), the loader
+    itself re-runs per app callback, and every central refresh -- the 304 path twice,
+    through ``_recompose_differs`` and ``apply_ceiling`` -- re-folds the ladder through
+    ``compose_installed_ceiling``.  Emitting from the parser therefore appended two SEL
+    rows and two warnings per callback plus two or three per poll, on every host in the
+    fleet, for a provisioning fact that does not change between polls.  The sibling
+    rows (``security_policy_tier_absent``, ``security_policy_tier_intersect``,
+    ``security_policy_env_tightens_only``) are latched the same way and for the same
+    reason: one row is what the fleet needs to compare against its records.
+    """
+    if _process_state.managed_sourceless_warned:
+        return
+    _process_state.managed_sourceless_warned = True
+    logger.warning(
+        "managed security policy declares distribution settings but no 'source'; "
+        "central distribution is OFF on this host and the managed document alone "
+        "is the ceiling. Name 'source' in the managed block to fetch a fleet "
+        "document (%s is not consulted on the managed tier).",
+        _POLICY_DISTRIBUTION_URL_ENV,
+    )
+    _audit_policy_tier(
+        "security_policy_managed_distribution_sourceless", TIER_MANAGED, TIER_CENTRAL
+    )
+
+
+def _managed_policy_path() -> Optional[Path]:
+    """Where the MDM drops the managed ceiling, or ``None`` on an unknown platform.
+
+    Resolved through a function (like :func:`_policy_home_path`) rather than a
+    constant so tests can point it somewhere writable -- and deliberately NOT
+    overridable by an environment variable, which would hand back the exact
+    weakness this tier exists to close.
+    """
+    # Read as ATTRIBUTES at call time, not bound with ``from ... import``: tests
+    # monkeypatch these flags on the ``platform_compat`` module to exercise every
+    # platform's branch from one runner, and a name bound at import would snapshot the
+    # runner's own platform and make those patches inert.
+    if platform_compat.IS_MACOS:
+        return _MANAGED_POLICY_MACOS
+    if platform_compat.IS_LINUX:
+        return _MANAGED_POLICY_LINUX
+    if platform_compat.IS_WINDOWS:
+        # NO managed tier on Windows, on purpose.  The obvious implementation --
+        # ``os.environ.get("ProgramData")`` -- resolves the "un-writable" path from a
+        # variable the launching user controls, and the ownership check that would
+        # catch it cannot run: there is no uid to compare, so the POSIX branch below
+        # returns early and only the regular-file test survives.  Together those two
+        # make a standard user able to point the TOP authority at a file they wrote,
+        # which is strictly worse than having no managed tier at all -- it is the very
+        # loosening this tier exists to prevent, wearing the tier's own authority.
+        #
+        # Enabling it needs the non-overridable known-folder API
+        # (``SHGetKnownFolderPath(FOLDERID_ProgramData)``) plus a real ACL check and
+        # reparse-point handling, none of which can be honestly tested from a POSIX
+        # host.  Until that lands, Windows reads as "no managed document", which is
+        # exactly the pre-existing behaviour rather than a false guarantee.
+        return None
+    return None
+
+
+def _assert_managed_file_trusted(fd: int, path: Path) -> None:
+    """Refuse a managed policy file that a non-root account could have written.
+
+    The tier's whole claim is "a standard user cannot author this", so the claim
+    is checked rather than assumed.  Anything that fails raises
+    ``PlatformCompositionError`` -- fail-closed -- because the alternative is
+    falling through to a lower, possibly permissive tier, which is precisely the
+    override this design removes.  A user-writable file at a managed path is
+    either a misconfiguration or an attempt, and neither should quietly widen the
+    ceiling.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise PlatformCompositionError(
+            f"managed security policy {path} is not a regular file; a managed ceiling "
+            "must be a file whose size can be bounded before it is read"
+        )
+    # Attribute read, not a bound name: tests patch the flag on the module.
+    if not platform_compat.IS_POSIX:
+        # Windows has no uid to compare. The machine-scoped ACL on ProgramData is
+        # the protection, and it is the OS's to enforce; recording the honest limit
+        # here beats a check that only looks like one.
+        return
+    if st.st_uid != 0:
+        raise PlatformCompositionError(
+            f"managed security policy {path} is owned by uid {st.st_uid}, not root. A "
+            "managed ceiling must be written by the MDM as root; refusing it rather "
+            "than falling through to a local tier."
+        )
+    if st.st_mode & _GROUP_WORLD_WRITE:
+        raise PlatformCompositionError(
+            f"managed security policy {path} is group- or world-writable "
+            f"(mode {stat.S_IMODE(st.st_mode):#o}); anyone in the group could rewrite "
+            "the fleet ceiling, so it is refused rather than trusted."
+        )
+    # The mode bits are not the whole answer. A POSIX ACL entry (``user:me:w`` on a
+    # root-owned 0644 file) does not appear in ``st_mode`` AT ALL -- the group triple
+    # shows the ACL mask, not that entry -- so a mode-only check reports "not writable"
+    # for a file this account can in fact rewrite, and the tier's whole claim ("a
+    # standard user cannot author this") would be false while looking checked.
+    #
+    # The question is asked of the FILE, not of this process: ``_acl_grants_write``
+    # reads the stored ACL and reports whether any entry grants write to a non-root
+    # principal. That is what makes the answer the same on a root-run gateway as on
+    # a user-run one -- an earlier revision asked ``faccessat(AT_EACCESS)`` "can *I*
+    # write this", which root always can, so it skipped the check as root and a
+    # ``user:me:w`` grant on a root-run host went unchecked.
+    if _acl_grants_write_to_non_root(fd):
+        raise PlatformCompositionError(
+            f"managed security policy {path} is writable by a non-root account through "
+            "an access-control entry the mode bits do not show (mode "
+            f"{stat.S_IMODE(st.st_mode):#o}); a managed ceiling a standard user can "
+            "rewrite is refused rather than trusted."
+        )
+
+
+#: Linux stores a file's POSIX ACL in this extended attribute (``acl(5)``). macOS uses
+#: a different ACL model (NFSv4-style ACEs behind ``acl_get_file(3)``) with no xattr of
+#: this name and no stdlib reader -- ``os.getxattr`` does not exist on Darwin -- so the
+#: read fails there and the check degrades to the mode bits, BY DESIGN and on record:
+#: see ``_acl_grants_write_to_non_root`` for why neither a ctypes ``libc`` binding nor a
+#: ``ls -lde`` subprocess is the right shape for this call site.
+_POSIX_ACL_XATTR = "system.posix_acl_access"
+#: ``acl_ea_header`` version and the entry tags/perm bit from ``posix_acl_xattr.h``.
+_POSIX_ACL_XATTR_VERSION = 0x0002
+_ACL_USER = 0x02
+_ACL_GROUP = 0x08
+_ACL_MASK = 0x10
+_ACL_WRITE = 0x02
+
+
+def _acl_grants_write_to_non_root(fd: int) -> bool:
+    """Whether the file's stored POSIX ACL grants write to a named non-root principal.
+
+    Reads the ``system.posix_acl_access`` xattr **through the open descriptor**, the
+    same one ``fstat`` just judged, so the ACL and the mode are read from one inode
+    and a path swap between the two reads cannot hand a clean mode to a file whose
+    ACL is then read from another.  Walks its entries -- each is a
+    ``(tag u16, perm u16, id u32)`` little-endian record after a 4-byte version header
+    (``posix_acl_xattr.h``). Only ``ACL_USER`` / ``ACL_GROUP`` entries carry a named
+    principal that ``st_mode`` cannot show; the owner, owning-group, mask and other
+    triples ARE the mode bits, which the caller has already judged. A named-user entry
+    for uid 0 grants nothing root did not already have and is not counted.
+
+    Independent of the calling process's identity by construction: it reads what is
+    stored, never asks the kernel "can I write this", so a root-run gateway and a
+    user-run one reach the same answer for the same file.
+
+    Returns ``False`` when the ACL cannot be read -- no xattr support, no ACL set
+    (``ENODATA``), a non-Linux ACL model (macOS), or a malformed blob. An unreadable
+    ACL is not evidence of write access; the mode check already stands, and refusing
+    here would abort boot on every filesystem whose ACLs cannot be queried.
+
+    **macOS is the documented limit of this check, not an oversight.** A Darwin ACE
+    granting a local user write on a root-owned ``0644`` managed plist is not seen here.
+    Two ways to see it were weighed and declined. A ``ctypes`` binding to
+    ``acl_get_file`` / ``acl_get_entry`` / ``acl_get_perm_np`` is a hand-written libc
+    ABI with no honest test from the Linux CI host -- the same reason the Windows
+    managed tier is absent rather than faked. A ``/bin/ls -lde`` subprocess is a
+    blocking call, and this function runs from ``load_security_policy``, which
+    ``mcp_gateway.app_call`` re-runs per app callback on the event loop (see the
+    no-blocking-syscall rule in ``AUTOSDE.yaml``). What this check defends against is
+    MISPROVISIONING -- root having granted a local account write -- not a root
+    attacker, who defeats any file-side predicate; on macOS that fact is the fleet's
+    to verify against its MDM profile payload, which is where the ACL came from.
+    """
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        return False
+    try:
+        # ``os.getxattr`` accepts an fd in place of a path; no ``follow_symlinks`` is
+        # needed because a descriptor names an inode, not a name to resolve.
+        blob = getxattr(fd, _POSIX_ACL_XATTR)
+    except (OSError, NotImplementedError, TypeError, ValueError):
+        return False
+    return _posix_acl_blob_grants_write_to_non_root(blob)
+
+
+def _posix_acl_blob_grants_write_to_non_root(blob: bytes) -> bool:
+    """Decode an ``acl_ea`` blob; True if a named non-root user/group may EFFECTIVELY write.
+
+    ``acl(5)``: the permissions of every named user, named group, and the owning group
+    are limited by the ``ACL_MASK`` entry, so ``user:alice:rw-,mask::r--`` grants alice
+    read only. The mask is read first and ANDed into each named entry before the write
+    bit is tested; an ACL with no mask entry (which the kernel only stores when there
+    are no named entries at all) applies no limit. Ignoring the mask could only
+    over-refuse -- effective write is a subset of raw write -- but a refusal here aborts
+    boot, so the honest answer is the effective one.
+    """
+    if len(blob) < 4 or (len(blob) - 4) % 8 != 0:
+        return False
+    if int.from_bytes(blob[:2], "little") != _POSIX_ACL_XATTR_VERSION:
+        return False
+    entries = []
+    mask = 0xFFFF  # no mask entry: every bit passes
+    for off in range(4, len(blob), 8):
+        tag = int.from_bytes(blob[off : off + 2], "little")
+        perm = int.from_bytes(blob[off + 2 : off + 4], "little")
+        principal = int.from_bytes(blob[off + 4 : off + 8], "little")
+        if tag == _ACL_MASK:
+            mask = perm
+        elif tag in (_ACL_USER, _ACL_GROUP):
+            entries.append((tag, perm, principal))
+    for tag, perm, principal in entries:
+        if tag == _ACL_USER and principal == 0:
+            continue
+        if perm & mask & _ACL_WRITE:
+            return True
+    return False
+
+
+def _assert_json_native_document(data: Mapping[str, object], path: Path) -> None:
+    """Refuse a managed document carrying a value JSON cannot represent.
+
+    ``plistlib`` decodes ``<date>`` to :class:`~datetime.datetime` and ``<data>`` to
+    ``bytes``, and ``json.dumps`` serializes neither.  That matters because the
+    signature payload is canonical JSON over the RAW document
+    (:func:`policy_signing_payload` -> ``admission.canonical_signing_bytes``, which
+    passes no ``default=``), so a SIGNED profile carrying a plist-native date raised
+    ``TypeError`` out of :func:`_verify_policy_signature` -- whose contract is that it
+    never raises.  ``context.safe_context_call`` re-raises only
+    :class:`PlatformCompositionError` and degrades every other exception to
+    open-source defaults, so the top-tier fleet ceiling was silently REMOVED: signing
+    a profile made the host LESS governed, inverting ``require_policy_signature``.
+    A ``<date>`` for any timestamp field is the idiomatic MDM spelling, so this was
+    the ordinary authoring mistake, not an exotic one.
+
+    REFUSED rather than coerced, deliberately.  Coercing would invent a
+    canonicalization no signer implements: the signature covers canonical JSON of the
+    document as read, and there is no defined plist-side signing procedure that
+    produces the same bytes, so a correctly signed profile would verify as UNVERIFIED
+    instead of crashing -- trading a loud failure for a silent authentication one, and
+    freezing the choice of coercion (``isoformat()``? base64?) into the trust root's
+    byte contract forever.  Raising here keeps the promise the tier already documents,
+    that a present-but-unusable managed document fails CLOSED.
+
+    Checked at READ time, so the refusal does not depend on the document being signed.
+    A value with no canonical form cannot be signed later either, and pinning it here
+    stops a refactor from narrowing the guard back to the signed path alone.
+    """
+
+    def walk(value: object, where: str) -> None:
+        # bool is a subclass of int, so the scalar test covers it.
+        if value is None or isinstance(value, (str, int, float)):
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise PlatformCompositionError(
+                        f"managed security policy {path} has a non-string key "
+                        f"{key!r} at {where or 'the document root'}"
+                    )
+                walk(item, f"{where}.{key}" if where else key)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk(item, f"{where}[{index}]")
+            return
+        raise PlatformCompositionError(
+            f"managed security policy {path} has a {type(value).__name__} value at "
+            f"{where or 'the document root'}, which JSON cannot represent. Write it as "
+            "a plist <string> instead -- an ISO-8601 timestamp for a date. The "
+            "signature payload is canonical JSON over the document as read, so a "
+            "<date> or <data> value has no signable form."
+        )
+
+    walk(dict(data), "")
+
+
+def _audit_managed_absent() -> None:
+    """Record that the managed tier is ABSENT and a local tier will govern.
+
+    This exists because the absence itself cannot be adjudicated on the host, and the
+    fleet is the only party that can tell the two causes apart. Read the next paragraph
+    before proposing that this be a refusal again.
+
+    **Why absence is not refused here, and must not be.** A reviewer looking at this
+    branch reliably reaches for "a local account could have DELETED the managed
+    document, so absence is an escape from the ceiling -- refuse to boot". That was
+    implemented, shipped, and withdrawn, and the reasons it cannot work are structural
+    rather than a matter of tuning the predicate:
+
+    * **It does not stop the adversary it names.** The threat model is an account that
+      wants out from under the fleet ceiling. Any such account with root simply tightens
+      the managed directory to root-owned and non-group-writable FIRST and unlinks the
+      document SECOND: every filesystem-forensic predicate then reads a pristine
+      directory and answers "genuine absence". Three commands, no detection. The only
+      party the predicate ever stopped was a NON-root account on a MISCONFIGURED host.
+    * **On a correctly provisioned host it is unreachable.** A real fleet's managed
+      directory is root-owned and not group-writable, which every version of the
+      predicate answered "genuine" for. So it never fired where the fleet cares.
+    * **Where it did fire, it fired on honest hosts, and the failure mode is a boot
+      abort.** Successive revisions each aborted a different legitimate shape: standalone
+      Macs (``/Library`` is ``drwxrwxr-t root admin`` and the default account is in
+      ``admin``), id-mapped NFS and container userns hosts (``/etc`` owned by uid 65534
+      ``nobody``), root-run installs, and Windows. A false positive did not degrade the
+      host, it refused to start it.
+    * **The presence check already covers the dangerous host.**
+      :func:`_assert_managed_file_trusted` refuses a document whose ownership or ACL lets
+      a local account rewrite it, so a sloppily provisioned host is already rejected
+      whenever a managed document EXISTS. The predicate only ever added the narrow
+      "sloppy host AND the document is already gone" cell.
+    * **Deletion and never-provisioned are the same syscall result.** ``FileNotFoundError``
+      carries no cause, and no local state can supply one that the same adversary could
+      not also remove.
+
+    So the honest division of labour is: the host reports its effective tier truthfully,
+    and the FLEET -- which knows which hosts it provisioned -- compares that against its
+    own records and revokes centrally. Detection belongs to the party the adversary does
+    not control. That is what this audit record is for, and it is the whole mechanism:
+    escape-by-deletion is an accepted, documented residual that is made VISIBLE rather
+    than a hole this tier pretends to have closed.
+
+    Emitted ONCE per process, from :func:`load_security_policy` behind the
+    ``absence_audited`` latch -- not from :func:`_read_managed_policy`, which also runs
+    on every central refresh and every local recompose, and not on every call of the
+    loader either, which ``mcp_gateway.app_call`` re-runs per app callback. Absence is a fact about how the host was provisioned and does not change
+    between polls, so recording it per interval would append one HMAC-chained row per
+    poll per standalone host for a decision that decided nothing (the same rule
+    ``_audit_refresh`` follows for an unchanged poll). One row at boot is what the fleet
+    needs to compare against its provisioning records.
+
+    Best-effort, never fatal, and deliberately so. Absence is the common case -- every
+    standalone install reaches here -- and making a governance decision contingent on an
+    SEL write would let one unwritable audit file refuse boot across a fleet. Only the
+    tier NAME is recorded, never the path, matching :func:`_audit_policy_tier`: the SEL is
+    readable through agent-reachable surfaces and the managed path is fleet control-plane
+    detail. The operator gets the path from the gateway log.
+    """
+    try:
+        sel().log_api_access(
+            caller="_host",
+            operation="security_policy_tier_absent",
+            outcome="allowed",
+            source="startup",
+            resources=f"{TIER_MANAGED}<-absent",
+            error="",
+        )
+    except Exception:
+        logger.debug("managed-absence SEL emit unavailable", exc_info=True)
+    logger.debug(
+        "no managed security policy on this host; the managed tier is inert and a local "
+        "tier will govern. If this host was provisioned, the fleet should see the absence "
+        "in the security_policy_tier_absent audit record and act on it centrally."
+    )
+
+
+def _read_managed_policy() -> Optional[Dict[str, object]]:
+    """Read the MDM-managed policy document, or ``None`` when the tier is inert.
+
+    ``None`` means "no managed file", which is every standalone install and is why
+    this tier costs nothing to ship.  A file that is PRESENT but untrusted,
+    unreadable, oversized, or not a JSON/plist object raises: a fleet that placed
+    a document here meant it to govern.
+    """
+    path = _managed_policy_path()
+    if path is None:
+        return None
+    # There is deliberately NO ``path.exists()`` pre-check. It looked harmless and was
+    # a downgrade path: ``exists()`` raises EACCES when the managed DIRECTORY is
+    # root-only -- which is precisely how a well-secured fleet configures
+    # /etc/kirocrew-managed -- and treating that as "no managed policy" silently handed
+    # governance to a lower local tier, so hardening the directory disabled the
+    # ceiling it was protecting. It was also a TOCTOU window. The open IS the
+    # existence test: only FileNotFoundError means absent, and every other error is a
+    # present-but-unreadable document that must fail closed.
+    #
+    # O_NOFOLLOW refuses a symlink planted at the managed path; O_NONBLOCK keeps a
+    # FIFO from blocking the open before the regular-file check can reject it.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        # Absent: the tier is inert and a local tier governs. This is every standalone
+        # install, and ``FileNotFoundError`` is the ONLY error that means absence.
+        #
+        # DO NOT turn this into a refusal. Absence has two causes -- never provisioned,
+        # or the document was deleted -- and they are the SAME syscall result, so the
+        # host cannot tell them apart. Inferring the cause from the holding directory's
+        # ownership and mode was implemented and withdrawn: any root account defeats it
+        # by tightening the directory before unlinking, a correctly provisioned fleet
+        # host never reaches the interesting branch at all, and each revision aborted
+        # BOOT on a different honest host shape (standalone macOS, id-mapped NFS,
+        # container userns, root-run installs, Windows). ``_audit_managed_absent``
+        # carries the full argument and the history -- read it before proposing the
+        # refusal again.
+        #
+        # The residual is accepted deliberately and made VISIBLE instead: the absence is
+        # audited, and the fleet -- which knows which hosts it provisioned, and which the
+        # adversary does not control -- is the party that compares and revokes. Note that
+        # a host whose managed directory is loose enough for a local account to tamper
+        # with is ALREADY refused by ``_assert_managed_file_trusted`` whenever a managed
+        # document is present.
+        #
+        # The audit is NOT emitted here. This reader runs at boot AND on every central
+        # refresh AND on every local recompose, and a standalone host would write one
+        # SEL row per poll interval for a fact that never changes. ``load_security_policy``
+        # emits it once, at boot, which is the only time the absence is news.
+        return None
+    except OSError as exc:
+        raise PlatformCompositionError(
+            f"managed security policy {path} could not be opened: {exc}. A managed "
+            "ceiling that is present but unreadable is refused rather than treated as "
+            "absent, because falling through would hand governance to a local tier."
+        ) from exc
+    try:
+        _assert_managed_file_trusted(fd, path)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            body = handle.read(_MANAGED_POLICY_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(body) > _MANAGED_POLICY_MAX_BYTES:
+        raise PlatformCompositionError(
+            f"managed security policy {path} exceeds {_MANAGED_POLICY_MAX_BYTES} bytes"
+        )
+    try:
+        if path.suffix == ".plist":
+            data = plistlib.loads(body)
+        else:
+            data = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise PlatformCompositionError(
+            f"managed security policy {path} is unreadable: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise PlatformCompositionError(f"managed security policy {path} is not a JSON/plist object")
+    # Before ANY consumer sees it: the signature payload canonicalizes the raw mapping,
+    # and a value JSON cannot represent crashes that with a non-composition error.
+    _assert_json_native_document(data, path)
+    return dict(data)
+
+
+def _intersect_ceilings(
+    authority: GovernanceCeiling, subordinate: GovernanceCeiling
+) -> GovernanceCeiling:
+    """Narrow *authority* by *subordinate* -- the subordinate can only tighten.
+
+    Reuses :func:`_compose_controls`, the same per-scope AND the profile layer
+    uses (allow∩, deny∪, ordinal=stricter, gate=AND), so "cannot widen" is a
+    property of the primitive rather than a rule this function has to police.
+
+    A scope the subordinate governs and the authority does not carries through:
+    an ungoverned scope is *unrestricted*, so adding a restriction to it is a
+    tightening, not an escape.  A scope the authority governs and the subordinate
+    does not keeps the authority's value, because a subordinate cannot repeal by
+    omission.
+
+    Everything outside ``controls`` stays the AUTHORITY's -- identity, signature
+    state, tier, update pins and distribution pins.  (The
+    distribution pins are additionally re-applied by :func:`compose_tier_ladder`,
+    which owns the one case this function cannot see: an authority that declared no
+    pins at all, where keeping "the authority's" would discard the pins of the tier
+    beneath it rather than preserve a choice.  Within a single intersection the rule
+    below still holds.)
+    A subordinate document must not be able to relabel whose ceiling this is, relax
+    an update pin, redirect where the next document is fetched from, or widen its
+    own escape hatch.
+
+    Every field outside ``controls`` falls into one of two classes, and the class
+    decides its precedence rule.  Get the class wrong and a lower tier widens the
+    ceiling through a side door ``_compose_controls`` never sees:
+
+    * **Absence means "no choice expressed"** -- ``distribution`` pins.  Nothing above
+      chose, so a lower tier supplying one redirects nothing; ``compose_tier_ladder``
+      lets the first declared value through.
+    * **Absence means the fail-closed floor** -- ``fallback_profile``, ``tier``,
+      identity, signature state, update pins.  Authority-only, never
+      ``authority.x or subordinate.x``.  For ``fallback_profile`` specifically: an
+      authority that declared none means an unusable profile file denies its whole
+      surface, and a subordinate supplying a looser fallback would REPLACE that
+      floor -- the escape hatch widened by the tier that is not allowed to widen
+      anything.  A subordinate that wants a fallback asks the fleet to declare one.
+
+    A new out-of-``controls`` field must be placed in one of the two classes here
+    before it is composed; copying a neighbour's rule is how the wrong class ships.
+    """
+    merged: Dict[str, object] = dict(authority.controls)
+    for scope, sub_control in subordinate.controls.items():
+        existing = merged.get(scope)
+        if existing is None:
+            merged[scope] = sub_control
+            continue
+        merged[scope] = _compose_controls(existing, sub_control)
+    boot = BootControls(
+        require_sandbox=authority.boot.require_sandbox or subordinate.boot.require_sandbox,
+        allow_terminal=authority.boot.allow_terminal and subordinate.boot.allow_terminal,
+        fail_closed=authority.boot.fail_closed or subordinate.boot.fail_closed,
+    )
+    # ``fallback_profile`` is deliberately NOT listed: ``replace(authority, ...)``
+    # keeps the authority's, which is the fail-closed-floor class above.
+    return replace(authority, boot=boot, controls=merged)
+
+
+def _audit_policy_tier(operation: str, authority_tier: str, lower_tier: str) -> None:
+    """Audit a tier composition.  Best-effort, never fatal.
+
+    Only tier NAMES are recorded -- module constants this process authored, never
+    a path or URL from the document, following the same rule the distribution
+    audit follows: the SEL is readable through agent-reachable surfaces and the
+    managed path is fleet control-plane detail.
+
+    Tightening is not a privilege escalation, so its record is a side-effect rather
+    than a precondition: making it fatal would let one unwritable SEL file refuse
+    boot on every governed host in a fleet -- a self-inflicted outage far wider than
+    the evidence gap it would close. (A record that GATES an action belongs to a path
+    where a local document outranks the fleet ceiling; no such path exists in this
+    ladder.)
+    """
+    try:
+        sel().log_api_access(
+            caller="_host",
+            operation=operation,
+            outcome="allowed",
+            source="startup",
+            resources=f"{authority_tier}<-{lower_tier}",
+            error="",
+        )
+    except Exception:
+        logger.debug("policy tier SEL emit unavailable", exc_info=True)
+
+
+def _warn_env_beneath_central_once(authority_tier: str) -> None:
+    """Say once per process that the env document now only TIGHTENS the fleet ceiling.
+
+    The precedence inversion this change ships is silent at the point it bites: a fleet
+    whose runbook set ``KIROCREW_SECURITY_POLICY`` to roll back a bad central push finds
+    the file demoted to tighten-only with no signal, mid-incident. This is the one shape
+    where an upgraded operator's mental model is wrong, so the first time it composes
+    the host says so -- a log line and a best-effort SEL row of the same shape as
+    ``_audit_managed_absent``. Once, because the shape is stable for the process
+    lifetime and a warning per compose would be a warning per refresh.
+    """
+    if _process_state.env_beneath_central_warned:
+        return
+    _process_state.env_beneath_central_warned = True
+    logger.warning(
+        "KIROCREW_SECURITY_POLICY is composed BENEATH the %s security policy and can "
+        "only tighten it. It no longer overrides the fleet document; to recover from a "
+        "bad central push, republish a good document at the source.",
+        authority_tier,
+    )
+    _audit_policy_tier("security_policy_env_tightens_only", authority_tier, TIER_ENV)
+
+
+def _audit_tier_intersect_once(authority_tier: str, lower_tier: str) -> None:
+    """Record a tier intersection the first time that PAIR composes in this process.
+
+    Keyed on the pair rather than a single process-wide flag so a tier that appears
+    later (an env document set after boot, a central document that arrives on the
+    first successful poll) is still recorded once, while the flagship shape --
+    managed + home present, recomposed on every app callback -- writes one row, not
+    one per interaction. See ``_TierProcessState.tier_intersects_audited``.
+    """
+    pair = (authority_tier, lower_tier)
+    if pair in _process_state.tier_intersects_audited:
+        return
+    _process_state.tier_intersects_audited.add(pair)
+    _audit_policy_tier("security_policy_tier_intersect", authority_tier, lower_tier)
+
+
+def compose_tier_ladder(
+    *tiers: Optional[GovernanceCeiling],
+) -> Optional[GovernanceCeiling]:
+    """Fold present tiers, highest first, into one ceiling.
+
+    The single implementation of precedence.  The highest present tier is the
+    authority; each lower one may only tighten it (:func:`_intersect_ceilings`).
+    There is deliberately NO path by which a lower tier replaces the authority: a
+    time-boxed rollback grant is deliberately absent (tracked as a follow-up issue,
+    see the enterprise governance guide), because a channel that lets a local document
+    outrank the fleet ceiling is the override this ladder exists to remove, however it
+    is dated.
+
+    Extracted so that boot and a live central refresh cannot drift: a refresh that
+    installed the fetched document alone would silently drop the managed authority
+    above it and every local restriction below it.
+    """
+    present = [tier for tier in tiers if tier is not None]
+    if not present:
+        return None
+    ceiling = present[0]
+    # The distribution pins ride OUTSIDE ``controls`` (they are values the core
+    # consumes, not a governed scope), so they are not carried by the per-scope
+    # compose the rest of this fold uses -- every path that REBUILDS a ceiling has
+    # to preserve them explicitly or the host silently loses the channel it fetches
+    # the ceiling from.  One path did: an authority that declared no distribution
+    # discarded the pins of the tier beneath it, which switches the central tier off
+    # and drops every centrally supplied restriction -- the looser-ceiling failure
+    # this ladder exists to prevent.  Tracking the value HERE, once, as the fold
+    # proceeds is what makes preserving it structural rather than a rule each
+    # ``return`` has to remember.
+    #
+    # Precedence is unchanged: a tier can only supply pins when NO tier above it
+    # declared any, so a lower document still cannot redirect a fetch source its
+    # authority chose.  When nothing above expressed a choice there is no choice to
+    # redirect away from -- the "absence means no choice" class in
+    # :func:`_intersect_ceilings`, and the rule ``resolve_distribution`` follows for a
+    # source-less managed block.
+    distribution = ceiling.distribution
+    for lower in present[1:]:
+        if not distribution.declared and lower.distribution.declared:
+            distribution = lower.distribution
+        if lower.tier == TIER_ENV and ceiling.tier in (TIER_MANAGED, TIER_CENTRAL):
+            _warn_env_beneath_central_once(ceiling.tier)
+        _audit_tier_intersect_once(ceiling.tier, lower.tier)
+        ceiling = _intersect_ceilings(ceiling, lower)
+    if distribution != ceiling.distribution:
+        # Only when the fold actually moved them, so a ceiling that composes alone
+        # is returned as the same object: callers assert that identity to prove a
+        # single document was installed untouched.
+        return replace(ceiling, distribution=distribution)
+    return ceiling
+
+
+def _managed_ceiling(
+    managed_data: Optional[Mapping[str, object]],
+) -> Optional[GovernanceCeiling]:
+    """Tier 1 -- the MDM-managed profile, from an already-read document.
+
+    Takes the document rather than reading it so one composition performs exactly
+    one open/fstat/trust-check of the managed file: the loader also needs the raw
+    mapping for the ``distribution`` peek, and a second read would both cost another
+    syscall round and make a trust failure's message depend on which call ran first.
+    """
+    if managed_data is None:
+        return None
+    state = _verify_policy_signature(managed_data, source="mdm-managed profile")
+    ceiling = parse_policy(managed_data, signature_state=state, managed=True)
+    # Mark the distribution pins as managed HERE rather than in ``from_dict``: the
+    # fact is about which tier the document came from, which only this function knows.
+    # It has to ride on the ceiling because the background refresher reads the pins
+    # back off the INSTALLED ceiling (``active_policy_distribution``), long after the
+    # tier that produced them is out of scope.
+    # Only a document that actually CARRIES a ``distribution`` block can pin one.
+    # Marking the flag unconditionally pinned a declaration that did not exist: on a
+    # managed host whose profile says nothing about distribution, the parsed value is
+    # a default, so the cadence variables were refused on behalf of a fleet that never
+    # expressed a cadence -- discarding an operator's own KIROCREW_POLICY_REFRESH to
+    # protect a choice nobody made. The empty-source half of that is already handled
+    # in ``resolve_distribution``; this is the half where there is no block at all.
+    declared_distribution = "distribution" in managed_data
+    return replace(
+        ceiling,
+        tier=TIER_MANAGED,
+        distribution=replace(ceiling.distribution, managed=declared_distribution),
+    )
+
+
+def _subordinate_ceiling(
+    bundled: Optional[Mapping[str, object]],
+    home_data: Optional[Dict[str, object]],
+    home_error: Optional[Exception],
+    home_path: Path,
+    env_data: Optional[Dict[str, object]] = None,
+    env_path: Optional[Path] = None,
+) -> Optional[GovernanceCeiling]:
+    """Tiers 3-5, first present wins: env -> bundled -> home.
+
+    Mutually exclusive by design, and collectively the *subordinate*: whichever one
+    is present may only tighten whatever authority sits above it.
+
+    *env_data* / *env_path* let a caller that ALREADY read the env document hand it
+    over instead of having this function read the file a second time -- which matters
+    because :func:`load_security_policy` has to peek that document's ``distribution``
+    block before the central tier runs, and two reads could disagree.  Omitting them
+    does not opt the tier out: the read then happens here instead, so
+    a caller that does not care about the declaration keeps the env tier for free.
+    """
+    if env_data is None and env_path is None:
+        env_data, env_path = _read_env_policy()
+    if env_data is not None and env_path is not None:
+        env_state = _verify_policy_signature(env_data, source=str(env_path))
+        return replace(parse_policy(env_data, signature_state=env_state), tier=TIER_ENV)
+    if bundled is not None:
+        # The bundled tier is NOT exempt from a fleet that opted into
+        # require_policy_signature. The plugin-admission manifest signature covers
+        # only name/publisher/version/capabilities
+        # (admission.PluginManifest.signing_payload), NOT the packaged
+        # security_policy.json bytes, so "covered by admission" did not in fact
+        # protect the resource -- a tampered bundled policy would have loaded
+        # unchecked.
+        bundled_state = _verify_policy_signature(bundled, source="companion-bundled resource")
+        return replace(parse_policy(bundled, signature_state=bundled_state), tier=TIER_BUNDLED)
+    if home_error is not None:
+        raise PlatformCompositionError(
+            f"security policy at {home_path} is unreadable: {home_error}"
+        ) from home_error
+    if home_data is not None:
+        home_state = _verify_policy_signature(home_data, source=str(home_path))
+        return replace(parse_policy(home_data, signature_state=home_state), tier=TIER_HOME)
+    return None
+
+
+def _read_env_policy() -> Tuple[Optional[Dict[str, object]], Optional[Path]]:
+    """Read the env tier eagerly, for the central tier's declaration peek.
+
+    Returns ``(None, None)`` when ``KIROCREW_SECURITY_POLICY`` is unset.  Unlike the
+    home tier the error is RAISED here rather than captured and re-raised further
+    down: the env tier outranks bundled and home, so there is no lower tier whose own
+    failure could have taken precedence over it, and hoisting the read only moves the
+    refusal earlier than the central fetch -- a fleet that pointed this variable at a
+    file it cannot read is misconfigured whether or not the poll would have answered.
+    The message is the one this path has always produced.
+    """
+    raw_env = os.environ.get(_POLICY_ENV, "").strip()
+    if not raw_env:
+        return None, None
+    env_path = Path(raw_env)
+    try:
+        return _read_json_file(env_path), env_path
+    except Exception as exc:  # fail-closed: a fleet pointed here on purpose.
+        raise PlatformCompositionError(
+            f"security policy at {env_path} (from {_POLICY_ENV}) is unreadable: {exc}"
+        ) from exc
+
+
+def _read_home_policy() -> Tuple[Optional[Dict[str, object]], Optional[Exception], Path]:
+    """Read the home tier eagerly, capturing rather than raising its error.
+
+    The CENTRAL tier needs to see whether a lower tier declares a ``distribution``
+    source, so the read has to happen before it -- but an unreadable home file must
+    still raise at its OWN point in precedence, further down, with its own message.
+    """
+    home_path = _policy_home_path()
+    if not home_path.exists():
+        return None, None, home_path
+    try:
+        return _read_json_file(home_path), None, home_path
+    except Exception as exc:
+        return None, exc, home_path
+
+
+def compose_installed_ceiling(central: GovernanceCeiling) -> GovernanceCeiling:
+    """Re-apply the tier ladder around a freshly fetched *central* document.
+
+    A central refresh replaces exactly one rung of the ladder.  Installing the
+    fetched document by itself would drop the managed authority ABOVE it and every
+    local restriction BELOW it, so a fleet that tightened a host at boot would find
+    that tightening silently gone at the first successful poll -- a ceiling that
+    loosens itself on a timer.  This routes a refresh through the same
+    :func:`compose_tier_ladder` boot uses, so the two cannot diverge.
+
+    Returns *central* unchanged when no other tier is present.
+    """
+    home_data, home_error, home_path = _read_home_policy()
+    subordinate = _subordinate_ceiling(
+        _process_state.last_bundled, home_data, home_error, home_path
+    )
+    # Tagged here exactly as boot tags it: ``parse_distributed_policy`` returns an
+    # untiered ceiling, and an untagged authority makes ``compose_tier_ladder``'s
+    # ``ceiling.tier in (TIER_MANAGED, TIER_CENTRAL)`` guard False -- so a host that
+    # reached the fleet document only on a later poll never got the env-tightens-only
+    # warning, and its intersect row read ``""<-env``.
+    if central.tier != TIER_CENTRAL:
+        central = replace(central, tier=TIER_CENTRAL)
+    composed = compose_tier_ladder(_managed_ceiling(_read_managed_policy()), central, subordinate)
+    # compose_tier_ladder only returns None when every argument was None, and
+    # ``central`` never is; the fallback keeps the signature honest for mypy.
+    #
+    # Deliberately NOT recorded as ``last_composed`` here: this is a pure fold, and the
+    # caller may go on to REJECT it (``apply_ceiling`` validates the fold before it
+    # installs). Recording a rejected fold would make the next 304 poll compare
+    # against it, read "nothing moved", and skip -- so a managed tightening that
+    # failed validation once would never install after the operator fixed the
+    # profile. ``record_composed_ceiling`` is called by the installer, after
+    # ``set_context`` succeeds.
+    return composed if composed is not None else central
+
+
 def load_security_policy(
     *, bundled_loader: Optional[Callable[[], Optional[Mapping[str, object]]]] = None
 ) -> Optional[GovernanceCeiling]:
-    """Load the enterprise security policy, or ``None`` for editable defaults.
+    """Load the enterprise security ceiling, or ``None`` for editable defaults.
 
-    Precedence (first present wins):
+    Precedence, highest first.  The top two tiers are AUTHORITIES; every tier
+    below one of them may only **tighten** it:
 
-    1. ``KIROCREW_SECURITY_POLICY`` env path — fleet hot-override, highest.
-    2. **the centrally distributed document** — fetched from ``KIROCREW_POLICY_URL``
+    1. the **MDM-managed configuration profile** — a root-owned file the device
+       management system re-asserts on every check-in
+       (:func:`_managed_policy_path`).  Highest because it is the only channel a
+       standard user cannot write: an environment variable is per-process and
+       redefinable by whoever launches the process, so an MDM can *set* one but
+       never *pin* one.
+    2. the **centrally distributed document** — fetched from ``KIROCREW_POLICY_URL``
        or from the ``distribution.source`` a lower tier declares, served from the
        last-known-good cache when the endpoint is unreachable.  See
-       :mod:`kiro_crew.platform.policy_distribution`.  Tier 1 stays above it so an
-       operator recovering from a bad central push has a channel that outranks the
-       thing that broke; tiers 3 and 4 sit below because they are what the fetched
-       document replaces.
-    3. ``bundled_loader()`` — the companion-bundled resource, supplied by the
-       caller when the active edition is ``amazon`` (Phase 9 packages it via
-       ``importlib.resources``).  The public core passes ``None`` here.
-    4. ``~/.kiro/crew/security_policy.json`` — standalone operator-authored.
-    5. None → editable secure-defaults (standalone, ungoverned ceiling).
+       :mod:`kiro_crew.platform.policy_distribution`.
+    3. ``KIROCREW_SECURITY_POLICY`` env path — local operator channel.
+    4. ``bundled_loader()`` — the companion-bundled resource, supplied by the
+       caller that knows the active edition.  The public core passes ``None``.
+    5. ``~/.kiro/crew/security_policy.json`` — standalone operator-authored.
+    6. None → editable secure-defaults (standalone, ungoverned ceiling).
 
-    A **present-but-unreadable / invalid** policy at the env or home path raises
-    ``PlatformCompositionError`` (fail-closed to strictest), mirroring
-    ``admission.load_admission_policy`` — a fleet that meant to enforce something
-    must never silently fall open.  The bundled loader is trusted (same author,
-    covered by the admission signature) so its parse errors also raise.
+    **Tiers 3–5 are mutually exclusive** (first present wins among them) and
+    collectively form the *subordinate*; tiers 1–2 stack above it.  The result is
+    ``managed ∘ central ∘ subordinate`` under :func:`_intersect_ceilings`, so a
+    local document can add restrictions but never remove one.
 
-    **Signature verification (``identity.signature``).**  The two FILE tiers (1
-    and 3) carry a detached signature over the canonical document
-    (:func:`policy_signing_payload`), verified against a trust key the
-    *operator-controlled admission policy* holds — never a key the security policy
-    supplies about itself.  The verdict is recorded on
-    ``GovernanceCeiling.signature_state`` and is **advisory by default**: an
-    unsigned or unverifiable policy still loads and still governs, so every
-    existing standalone install and every existing policy file keeps working
-    byte-for-byte unchanged.  Setting ``require_policy_signature`` in the
-    admission policy makes it mandatory, and a failure then raises
-    ``PlatformCompositionError`` (boot aborts) like every other fail-closed check
-    in this module.
+    **Why the env tier sits beneath the central push.**  An env tier that outranks
+    the fleet document is a rollback lever, and a rollback lever makes the enterprise
+    ceiling advisory: any account that can set an environment variable could point it
+    at a permissive file and the fleet's ceiling would never bind.  There is no local
+    rollback lever in this ladder: recovery from a bad central push is by
+    re-publishing a good document at the source, and a local, time-boxed override is
+    tracked as a follow-up issue (see the enterprise governance guide) rather than
+    provided here.
 
-    **All three tiers are verified — none is exempt.**  The plugin-admission
-    manifest signature covers only the manifest fields (name / publisher /
-    version / capabilities — ``admission.PluginManifest.signing_payload``), NOT
-    the bytes of the packaged ``security_policy.json``, so "covered by admission"
-    never actually protected the bundled resource: a tampered bundled policy would
-    have loaded unchecked.  So the bundled tier passes ``signable=True`` like the
-    file tiers.  When ``require_policy_signature`` is OFF (the default, and what
-    the ``amazon`` edition ships) verification is advisory at every tier and an
-    unsigned bundled policy still loads — so existing installs are unchanged; when
-    it is ON, an edition signs its bundled policy like any other governed tier.
-    A **missing** policy does not satisfy the requirement either: with a genuine
-    opt-in and no policy at any tier, boot aborts rather than running ungoverned.
+    A **present-but-unreadable / invalid** policy at the managed, env or home path
+    raises ``PlatformCompositionError`` (fail-closed to strictest), as does a
+    managed file that is not root-owned or is group/world-writable — falling
+    through to a lower tier there would restore the very override this order
+    removes.
+
+    **Signature verification (``identity.signature``).**  Every tier's document is
+    checked as it is read, so every ``GovernanceCeiling`` carries its own verdict; an
+    issuer holding an Ed25519 public key in the trust root
+    is verified asymmetrically and never falls back to a shared secret.  The
+    verdict is recorded on ``GovernanceCeiling.signature_state`` and is
+    **advisory by default**, so existing installs and policy files keep working
+    unchanged.  ``require_policy_signature`` in the admission policy makes a
+    verified signature mandatory; a fleet that wants only asymmetric proofs removes
+    the issuer's ``trust_keys`` entry.  Enforcement lives in
+    :func:`assert_policy_signature_satisfied`, which runs once on the FINAL
+    composed ceiling — this function is called more than once per boot with
+    different arguments, so a tier the final ceiling never came from must not be
+    able to abort boot.
     """
-    raw_env = os.environ.get(_POLICY_ENV, "").strip()
-    if raw_env:
-        path = Path(raw_env)
-        try:
-            data = _read_json_file(path)
-        except Exception as exc:  # fail-closed: a fleet pointed here on purpose.
-            raise PlatformCompositionError(
-                f"security policy at {path} (from {_POLICY_ENV}) is unreadable: {exc}"
-            ) from exc
-        state = _verify_policy_signature(data, source=str(path))
-        return parse_policy(data, signature_state=state)
+    # Tier 1 — the managed profile. Raises on a present-but-untrusted file.
+    managed_data = _read_managed_policy()
+    managed = _managed_ceiling(managed_data)
+    if (
+        managed_data is None
+        and _managed_policy_path() is not None
+        and not _process_state.absence_audited
+    ):
+        # The first load in this process is the one time the absence is news; see
+        # ``_audit_managed_absent`` for why it is reported rather than refused, and why
+        # not per refresh. The latch, not this call site, is what makes it once: this
+        # loader also runs per app callback. The path test keeps a platform with NO
+        # managed tier (Windows) from reporting an absence it could never have had.
+        _process_state.absence_audited = True
+        _audit_managed_absent()
 
+    # Resolved BEFORE the central tier because the fetch source may be declared by
+    # a lower tier's ``distribution`` block, and the peek follows the same
+    # precedence the tiers themselves do. The bundled resource is resolved even when
+    # the env tier is set: the env tier does not short-circuit the central one, so
+    # its declaration still has to be seen.
     bundled = bundled_loader() if bundled_loader is not None else None
+    if bundled is not None:
+        # Remembered so a later central refresh can still see this tier; see
+        # ``_TierProcessState.last_bundled``.
+        _process_state.last_bundled = bundled
 
-    home_path = _policy_home_path()
-    home_data: Optional[Dict[str, object]] = None
-    home_error: Optional[Exception] = None
-    if home_path.exists():
-        # Read here rather than at the home tier below because the CENTRAL tier
-        # needs to see whether a lower tier declares a ``distribution`` source.
-        # The read is captured, not acted on: an unreadable home file still raises
-        # with the same message at the same point in precedence, one tier down.
-        try:
-            home_data = _read_json_file(home_path)
-        except Exception as exc:
-            home_error = exc
+    home_data, home_error, home_path = _read_home_policy()
+    # Read BEFORE the central tier for the same reason the home tier is: the peek
+    # below has to see this document's ``distribution`` block. Read once and passed
+    # down to ``_subordinate_ceiling`` so the tier and the peek cannot see different
+    # bytes.
+    env_data, env_path = _read_env_policy()
 
-    # Tier 2 — the centrally distributed ceiling. The source comes from the env
-    # (the fleet lever) or from the ``distribution`` block a lower tier declares
-    # (self-refresh), preferring the bundled declaration over the home one so the
-    # peek follows the same precedence the tiers themselves do. Returns None when
-    # distribution is not configured, or when it is configured, could not be
-    # established, and the policy chose to degrade; raises under the fail-closed
-    # default. Fully inert — not even an import — when nothing declares a source.
+    # Tier 2 — the centrally distributed ceiling. Returns None when distribution is
+    # not configured, or when it is configured, could not be established, and the
+    # policy chose to degrade; raises under the fail-closed default. Fully inert —
+    # not even an import — when nothing declares a source.
     # ``_POLICY_DISTRIBUTION_CACHE_ONLY_ENV`` is in this condition because a
     # cache-only child (an app backend) is given NO source by design — the tier is
     # what reads the cache the gateway wrote, so gating entry on a source would skip
     # it and drop that child to a local or absent ceiling: exactly the looser-ceiling
     # failure cache-only mode exists to prevent.
-    declared = _declared_distribution(bundled) or _declared_distribution(home_data)
+    #
+    # The variable IS user-settable, and the cache directory IS user-writable, so a
+    # local account can set it and plant a document. Three things bound what that buys,
+    # and a reviewer proposing to gate the flag on something else should weigh them:
+    # (1) the planted document is verified exactly as a fetched one is, so under
+    # ``require_policy_signature`` it is refused; (2) it lands in the CENTRAL rung and
+    # the managed tier is composed ABOVE it from disk, so it cannot loosen or replace
+    # the fleet's managed document, only supply controls that document did not set;
+    # (3) on a host with no managed tier that is the same power the account already
+    # has through KIROCREW_POLICY_URL, which the non-managed tiers honour by design.
+    # Activating cache-only through a parent-authenticated channel rather than the
+    # environment would close (3) for children and is tracked as a follow-up; it is a
+    # new IPC contract, not a change to this ladder.
+    central: Optional[GovernanceCeiling] = None
+    # The peek follows the SAME order the tiers do, which is why the env document is
+    # in the chain: it is tier 3, above bundled and home. Leaving it out meant an
+    # env-declared ``distribution.source`` was silently ignored and the central tier
+    # never loaded from it. Only the managed declaration is marked un-overridable --
+    # a lower tier declaring a source is the standalone operator choosing where their
+    # own ceiling comes from, which is theirs to choose.
+    managed_declared = _declared_distribution(managed_data, managed=True)
+    # PRESENCE of the key is decisive, not whether it resolved to a source. A managed
+    # ``distribution: {}`` declares "the fleet owns this channel" while naming no address.
+    # Where the fleet declared the channel and named no address, NOTHING else may supply
+    # one: not a lower tier (so the ``or`` chain below is skipped), and not
+    # KIROCREW_POLICY_URL either -- the environment is the local account's, and
+    # ``resolve_distribution`` refuses it because the peek hands it a declaration that
+    # still carries ``managed=True``. The central tier simply stays off until the fleet
+    # names a source.
+    managed_declares_channel = isinstance(managed_data, Mapping) and "distribution" in managed_data
+    if managed_declares_channel:
+        declared = managed_declared
+    else:
+        declared = (
+            managed_declared
+            or _declared_distribution(env_data)
+            or _declared_distribution(bundled)
+            or _declared_distribution(home_data)
+        )
     if (
         declared is not None
         or os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip()
@@ -2935,46 +3997,36 @@ def load_security_policy(
 
         distributed = load_distributed_policy(declared)
         if distributed is not None:
-            return distributed
+            central = replace(distributed, tier=TIER_CENTRAL)
 
-    if bundled is not None:
-        # The bundled tier is NOT exempt from a fleet that opted into
-        # require_policy_signature. The plugin-admission manifest signature
-        # covers only name/publisher/version/capabilities
-        # (admission.PluginManifest.signing_payload), NOT the packaged
-        # security_policy.json bytes, so "covered by admission" did not in
-        # fact protect the resource — a tampered bundled policy would have
-        # loaded unchecked. When require is OFF this is advisory exactly like
-        # the file tiers (an unsigned bundled policy still loads), so the
-        # standalone/default and the Amazon edition (which sets no require)
-        # are unaffected; when require is ON the edition must sign its
-        # bundled policy like any other governed tier.
-        state = _verify_policy_signature(bundled, source="companion-bundled resource")
-        return parse_policy(bundled, signature_state=state)
+    # Tiers 3–5 — the subordinate, first present wins.
+    subordinate = _subordinate_ceiling(
+        bundled, home_data, home_error, home_path, env_data, env_path
+    )
 
-    if home_error is not None:
-        raise PlatformCompositionError(
-            f"security policy at {home_path} is unreadable: {home_error}"
-        ) from home_error
-    if home_data is not None:
-        state = _verify_policy_signature(home_data, source=str(home_path))
-        return parse_policy(home_data, signature_state=state)
-
-    # No policy at env, bundled, OR home tier → ungoverned (editable defaults).
-    #
-    # This function deliberately does NOT refuse boot here, because it cannot tell
-    # whether it is the LAST word on the question. ``load_security_policy()`` is
-    # called more than once per boot with different arguments: the core calls it
-    # with NO bundled_loader first (``bootstrap.build_default_context``) and a
-    # companion edition re-invokes it WITH its loader afterwards. "No policy at any
-    # tier" is therefore only decidable once composition has finished, so the
-    # fail-closed refusal lives in :func:`assert_policy_signature_satisfied`, which
-    # boot calls on the FINAL context alongside the other governance floor gates.
-    return None
+    composed = compose_tier_ladder(managed, central, subordinate)
+    # Recorded even when None: a host with no policy at any tier has no fold for a
+    # refresh to compare against, and a refresh cannot run there anyway.
+    _process_state.last_composed = composed
+    if composed is None:
+        # No policy at any tier → ungoverned (editable defaults).
+        #
+        # This function deliberately does NOT refuse boot here, because it cannot tell
+        # whether it is the LAST word on the question. ``load_security_policy()`` is
+        # called more than once per boot with different arguments: the core calls it
+        # with NO bundled_loader first (``bootstrap.build_default_context``) and a
+        # companion edition re-invokes it WITH its loader afterwards. "No policy at any
+        # tier" is therefore only decidable once composition has finished, so the
+        # fail-closed refusal lives in :func:`assert_policy_signature_satisfied`, which
+        # boot calls on the FINAL context alongside the other governance floor gates.
+        return None
+    return composed
 
 
 def _declared_distribution(
     data: Optional[Mapping[str, object]],
+    *,
+    managed: bool = False,
 ) -> Optional[PolicyDistribution]:
     """Peek a lower tier's ``distribution`` block, for the central tier's source.
 
@@ -2982,15 +4034,13 @@ def _declared_distribution(
     supplies none either — so the central tier stays completely inert, not even imported,
     on every install that does not use it.
 
-    The environment half of that condition is load-bearing, not defensive. A block with
-    settings and no ``source`` is legitimate when ``KIROCREW_POLICY_URL`` supplies the
-    address: that is the ordinary two-channel split, where whatever provisions the host owns
-    the address while the fleet publishes the cadence, the staleness bound and — the one
-    that bites — ``on_unavailable``. Discarding such a declaration parsed it and then threw
-    it away, so a fleet that had chosen ``degrade`` silently got the ``fail_closed`` default
-    and aborted startup on the first outage. ``resolve_distribution`` overlays the
-    environment onto whatever is returned here, so returning the settings is what lets the
-    two channels combine at all.
+    The environment half of that condition serves the NON-managed tiers. A standalone
+    operator may keep a document with settings and no ``source`` and supply the address
+    through ``KIROCREW_POLICY_URL`` -- their own host, their own choice -- and discarding
+    the declaration would throw away the ``on_unavailable`` they chose. For the MANAGED
+    tier the environment never supplies the address (``resolve_distribution`` pins it),
+    so a source-less managed block that this returns is carried for its settings only and
+    leaves the central tier off; that is deliberate, see the loader.
 
     Deliberately does **not** validate the rest of the document.  This is a peek at
     one key, ahead of the tier that will parse the whole thing: a policy whose
@@ -3007,7 +4057,20 @@ def _declared_distribution(
         return None
     if not isinstance(raw, Mapping):
         raise PlatformCompositionError("security policy 'distribution' must be an object")
-    declared = PolicyDistribution.from_dict(raw)
+    declared = PolicyDistribution.from_dict(raw, managed=managed)
+    if managed:
+        # EVERY managed declaration leaves here marked, source or no source, because the
+        # mark is what makes the pin bind: ``resolve_distribution`` refuses
+        # ``KIROCREW_POLICY_URL`` and the cadence variables only for a declaration it can
+        # see is managed, and ``from_dict`` never sets the flag (a document must not be
+        # able to claim its own un-overridability). Two revisions each lost half of this.
+        # One answered ``None`` for a source-less block, so the engine got no declaration
+        # and the variable supplied the address. The next marked only the source-less
+        # branch, so a managed block that NAMED a source reached the engine unmarked and
+        # the same variable replaced the fleet's address with the local account's -- the
+        # exact redirection the managed pin exists to refuse. Mark once, before the
+        # branch, so there is no branch that can forget.
+        return replace(declared, managed=True)
     if declared.enabled:
         return declared
     # Source-less, so only worth carrying when the environment names the address the
@@ -3786,6 +4849,8 @@ __all__ = [
     "parse_policy",
     "parse_profile",
     "load_security_policy",
+    "compose_installed_ceiling",
+    "reset_process_state",
     "resolve",
     "resolve_pinned_commands",
     "resolve_ordinal",
