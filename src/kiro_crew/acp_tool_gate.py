@@ -334,14 +334,13 @@ def enforce_runtime_routing(
     Raises :class:`ToolGateUnroutable` before the first prompt can run, or returns
     for a harness this core does not enforce.
 
-    **There is deliberately no opt-out.** An earlier revision carried
-    ``agent.acp_backend_allow_ungated_tools``, a LOCAL config bool that started the
-    session anyway with a warning and an audit event. That is the precise shape the
+    **There is deliberately no opt-out.** A LOCAL config bool that started the
+    session anyway with a warning and an audit event is the precise shape the
     central governance ceiling exists to forbid: a managed fleet could allow this
     harness while a standard user's own config switched the compensating control
-    off, so POLICY-intersect-PROFILE would no longer hold for the calls the harness
+    off, so POLICY-intersect-PROFILE would not hold for the calls the harness
     self-approves. A security control with a local off-switch is not a control, and
-    the escape hatch it offered was never needed -- the refusal names the concrete
+    such an escape hatch is not needed -- the refusal names the concrete
     remedy (:func:`remediation_for`), and lowering the sandbox tier remains an
     operator decision that IS clamped by the ceiling.
 

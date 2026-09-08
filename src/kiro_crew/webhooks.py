@@ -22,7 +22,7 @@ Both stores use the same on-disk discipline as ``register_hook``:
 read-modify-write under an advisory ``flock`` on a sidecar ``.lock`` file,
 then an atomic ``os.replace`` of a 0600 temp file.
 
-SECRET AT REST — ``webhook_tokens.json`` is no longer hash-only. Bearer tokens
+SECRET AT REST — ``webhook_tokens.json`` is not hash-only. Bearer tokens
 are still stored as sha256 digests and cannot be recovered from the file, but
 each entry's ``signing_secret`` is a LIVE secret held in plaintext: an HMAC is
 symmetric, so the verifier has to be able to recompute it. That is an accepted
@@ -188,7 +188,7 @@ def locked(path: Path) -> Iterator[None]:
     lock_path = path.parent / (path.name + ".lock")
     # touch + "r+", never "w": a truncating open of a lock file another holder
     # already locked raises a sharing violation on Windows instead of waiting.
-    # Full rationale at work_ledger._open_lock (issue #9248).
+    # Full rationale at work_ledger._open_lock.
     lock_path.touch(exist_ok=True)
     with open(lock_path, "r+") as lock_fd:
         with platform_compat.flock_exclusive(lock_fd.fileno()):
@@ -204,10 +204,10 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     synonym for ``mode=0o600``: this store holds signing secrets, and on
     Windows a bare 0600 is a no-op, so the helper applies the owner-only DACL
     to the temp file BEFORE ANY PAYLOAD BYTE IS WRITTEN. Locking down after
-    the write left a window where the secrets sat in a file carrying only the
-    parent directory's inherited ACL. That ordering used to be hand-rolled
-    here; it is now :func:`atomic_write`'s documented contract, which also
-    brings the Windows ``os.replace`` sharing-violation retry this copy lacked.
+    the write would leave a window where the secrets sit in a file carrying only
+    the parent directory's inherited ACL. That ordering is
+    :func:`atomic_write`'s documented contract rather than hand-rolled here,
+    which also brings the Windows ``os.replace`` sharing-violation retry.
 
     Content is ``bytes`` rather than ``str`` on purpose: ``indent=2`` embeds
     newlines, and text mode would translate them to CRLF on Windows.
@@ -278,10 +278,10 @@ class WebhookTokenStore:
 
         ``_read_json`` already fails closed on bytes it cannot parse. This is the
         same hazard one level up: JSON that parses fine but whose container is
-        not a list, or whose rows are not credential rows, used to be filtered
-        away silently — and every caller that mutates the store (``mint``,
+        not a list, or whose rows are not credential rows, must not be filtered
+        away silently — every caller that mutates the store (``mint``,
         ``revoke``, ``stamp_used``) writes the loaded list straight back, so the
-        filtered-out rows were deleted on the next write. That destroys issued
+        filtered-out rows would be deleted on the next write. That destroys issued
         credentials and their signing secrets, and because the kill switch lives
         in this same file it could also drop the disabled state. Refusing keeps
         the bytes on disk for an operator to inspect, at the cost of erroring the

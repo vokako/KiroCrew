@@ -8,12 +8,12 @@ edition plugin adds its own from ``ProviderRegistry.register_acp_backends`` by c
 
 A LEAF module on purpose. ``kiro_crew/acp/__init__.py`` imports the ACP client and
 runtime, so reaching ``kiro_crew.acp.types`` executes that package init and lands
-back in ``config.loader`` — the cycle ``_normalize_acp_backend`` used to defer for.
-That cycle is why the selectable list used to be a **literal in three unrelated
+back in ``config.loader`` — the cycle ``_normalize_acp_backend`` defers for.
+That cycle is why the selectable list cannot be a **literal in three unrelated
 places** (the loader's ``acp_backend`` field metadata, the dashboard's PATCH
 allowlist, and ``acp.types``) with a drift test standing in for a code owner: none
 of the three could import the others. Nothing here imports ``kiro_crew.acp``,
-``kiro_crew.config`` or ``kiro_crew.platform``, so all three now derive from this
+``kiro_crew.config`` or ``kiro_crew.platform``, so all three derive from this
 module — and a plugin-registered backend reaches the dashboard without a core
 edit, which a literal could never do.
 
@@ -343,7 +343,7 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # never emits a compaction status in response — its ``summarization_*`` frames
 # (mapped to compaction status by ``acp.kas_wire``) fire only for
 # KAS-initiated auto-summarization. A manual ``/compact`` on KAS therefore
-# strands the status waiter for the full ``COMPACT_WAIT_TIMEOUT_SECS`` (#7800),
+# strands the status waiter for the full ``COMPACT_WAIT_TIMEOUT_SECS``,
 # so the manual entry points refuse it up front instead. This set gates ONLY
 # the manual command: KAS auto-summarization keeps mapping to compaction
 # status unchanged.

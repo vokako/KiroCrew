@@ -736,8 +736,8 @@ def _open_store_ffmpeg_resource() -> _AuthenticatedFfmpeg | None:
 
     The third and last source, after a bundled interpreter's own payload and a
     package manager's system FFmpeg. It exists because a source install on a
-    distribution that ships no FFmpeg package previously had no decoder it could
-    ever reach, and the store is how ``stt.decoder`` puts the SAME upstream bytes
+    distribution that ships no FFmpeg package has no other decoder it can
+    reach, and the store is how ``stt.decoder`` puts the SAME upstream bytes
     the desktop release carries onto such a host.
 
     This does not widen the trust model, and the distinction is worth being exact
@@ -984,7 +984,7 @@ def _describe_ffmpeg_exit(returncode: int | None, stderr_tail: str) -> str:
     signalled child usually wrote no stderr, so a bare "exited -9 ...
     (no stderr)" reads as corrupt audio. On macOS the likeliest sender for a
     just-spawned staged binary is the asynchronous system policy assessment
-    denying the exec (#8918), so name that path in the line.
+    denying the exec, so name that path in the line.
     """
     detail = stderr_tail or "(no stderr)"
     if returncode is None or returncode >= 0:
@@ -1006,8 +1006,8 @@ async def _create_ffmpeg_subprocess(
     A returning ``create_subprocess_exec`` means only that the fork/exec was
     issued, not that the platform authorized it: on macOS the syspolicy
     assessment resolves the staged *path* asynchronously after the spawn, so
-    closing the handle here (which removes the staged directory) had the
-    kernel deny the exec with SIGKILL (#8918). The caller therefore owns the
+    closing the handle here (which removes the staged directory) makes the
+    kernel deny the exec with SIGKILL. The caller therefore owns the
     close and must run it once the child has exited. A failed spawn never
     produced a child, so nothing depends on the path surviving and the handle
     is closed here before the error propagates.
@@ -1018,7 +1018,7 @@ async def _create_ffmpeg_subprocess(
     user mean this" filter, not a content check, so a file whose bytes are an
     HLS/ffconcat playlist reaches the demuxer — without the protocol pin the
     demuxer would then FETCH the playlist's segment URLs (SSRF from a crafted
-    recording, GPT review r19). Every caller in this module reads one
+    recording). Every caller in this module reads one
     validated local file and writes a local temp file, a null sink, or a pipe,
     so nothing legitimate needs a network protocol; the pin applies to nested
     opens (playlist segments) as well as the top-level input.
@@ -1052,7 +1052,7 @@ async def _create_ffmpeg_subprocess(
 #: pin: the protocol allowlist stops NETWORK fetches, but a crafted
 #: allowed-suffix HLS/ffconcat playlist could still make an auto-probed demuxer
 #: open OTHER LOCAL FILES its text names — reads that never went through
-#: ``validate_file_path`` (GPT review r20). With the suffix's own demuxer
+#: ``validate_file_path``. With the suffix's own demuxer
 #: forced, playlist text is a decode error rather than a set of paths to open.
 #: A mislabeled-but-genuine recording is refused the same way, which matches
 #: the import vet gate's "did the user mean this" contract.
@@ -1075,7 +1075,7 @@ _DEMUXER_BY_SUFFIX = {
 #: Descriptor-path inputs (``/dev/fd/N``, and Linux's ``/proc/self/fd/N``): an
 #: import hands its consumers one of these instead of the snapshot's mutable
 #: name, so every open — ours and FFmpeg's — pins the inode the route opened
-#: (GPT review r21: a same-uid racer could otherwise swap the snapshot between
+#: (a same-uid racer could otherwise swap the snapshot between
 #: the duration probe and the transcode, defeating the truncation guard).
 _DEV_FD_RE = re.compile(r"^(?:/dev/fd|/proc/self/fd)/(\d+)$")
 
@@ -1131,7 +1131,7 @@ def _forced_demuxer_args(audio_path: str) -> tuple[str, ...]:
             # IMPORT_AUDIO_EXTENSIONS entry). The resolution follows the
             # descriptor's CURRENT name, so an unmapped answer here means the
             # snapshot was renamed after pinning — a same-uid racer stripping
-            # the suffix to re-enable content sniffing (GPT review r25).
+            # the suffix to re-enable content sniffing.
             # Refuse: a rename may only ever cause a loud refusal, never a
             # sniffed playlist.
             raise OSError(f"descriptor input {audio_path} resolved to unmapped suffix {suffix!r}")
@@ -1395,8 +1395,8 @@ def _under_voice_runtime_root(real: str) -> bool:
     The crew ``run/`` directory is a read+write-sensitive leaf (it holds spawn
     trust roots), so ``is_sensitive_path`` refuses everything beneath it —
     including the import snapshots this gateway itself stages under
-    ``run/voice-runtime`` precisely BECAUSE agents cannot reach that root
-    (GPT review r29 relocation). Judged against the kernel-resolved name of an
+    ``run/voice-runtime`` precisely BECAUSE agents cannot reach that root.
+    Judged against the kernel-resolved name of an
     already-pinned descriptor, membership here means "a file this process
     staged", not "a caller-supplied path": the route's own vet gate has
     already refused sensitive ORIGINAL paths before any snapshot exists.
@@ -1643,12 +1643,12 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
             except BaseException:
                 # ``CancelledError`` derives from ``BaseException``, so the
                 # ``Exception`` guard above never sees it: a cancellation landing
-                # mid-``communicate`` used to leave the ffmpeg child running and the
-                # owned temp on disk (#5780). Mirror ``_to_native_audio``'s cleanup
-                # (#5777): stop AND reap the child BEFORE the unlink — Windows keeps
+                # mid-``communicate`` would leave the ffmpeg child running and the
+                # owned temp on disk. Mirror ``_to_native_audio``'s cleanup:
+                # stop AND reap the child BEFORE the unlink — Windows keeps
                 # the output file locked until the child fully exits, and on POSIX a
                 # live child can race the removal. Every step is best-effort, and
-                # the unlink stays synchronous (one-file unlink, matching #5777): a
+                # the unlink stays synchronous (one file): a
                 # repeat cancellation could eat an off-loop hop before it runs. The
                 # exception in flight is the one that must surface.
                 if proc is not None:
@@ -1677,7 +1677,7 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
                         pass
                 raise
         finally:
-            # The authenticated handle must outlive the spawn (#8918): every
+            # The authenticated handle must outlive the spawn: every
             # branch above has already reaped the child (``communicate`` on
             # success and on a nonzero exit, kill-and-reap on timeout and on
             # cancellation), so the staged image can be released now. The
@@ -1756,7 +1756,7 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
         # Nested ``finally`` so the unlink is unconditional: the ``end_stream``
         # await can itself raise on a REPEAT cancellation (``CancelledError`` is
         # a ``BaseException``, so its ``Exception`` guard misses it), and that
-        # escape used to skip the temp removal below (#5780).
+        # escape would otherwise skip the temp removal below.
         try:
             if stream is not None:
                 try:
@@ -1769,8 +1769,8 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
                     await asyncio.to_thread(_unlink_if_exists, tmp_ogg)
                 except BaseException:
                     # A repeat cancellation can land on this await before the
-                    # off-loop hop runs; unlink synchronously (one file,
-                    # matching #5777) and let the cancellation propagate. The
+                    # off-loop hop runs; unlink synchronously (one file) and
+                    # let the cancellation propagate. The
                     # OSError guard keeps a locked/contended file from
                     # REPLACING the exception already in flight.
                     try:
@@ -1808,7 +1808,7 @@ def batch_duration_cap_secs(stt_config=None) -> int | None:  # type: ignore[no-u
     passes ``-t``), and neither reports that it did. The Apple lane's
     to-native conversion is bounded the same way (``-t`` on the remux — an
     unbounded conversion of a large low-bitrate input could exhaust the temp
-    volume, GPT review r23), so it shares the ceiling. AWS Transcribe refuses
+    volume), so it shares the ceiling. AWS Transcribe refuses
     an oversized payload outright (a loud ``None``), so for it there is no
     silent ceiling to guard. Callers that must not dispatch a truncated
     transcript — the meetings import route — ask here which ceiling applies
@@ -1927,7 +1927,7 @@ async def audio_exceeds_secs(
             return None
         return int(matches[-1]) / 1_000_000 > max_secs
     finally:
-        # The authenticated handle must outlive the spawn (#8918): every path
+        # The authenticated handle must outlive the spawn: every path
         # reaching this ``finally`` has already reaped the child (``communicate``
         # on success and nonzero exit, kill-and-reap on timeout and
         # cancellation) or never spawned one, so the staged image can be
@@ -1981,13 +1981,13 @@ def _pcm_from_wav(audio_path: str) -> np.ndarray | None:
             # Fold to mono in BYTE-bounded slices. A whole-file read would hold
             # the interleaved int16 buffer AND its float32 conversion at once —
             # around 1.5 GiB for a four-channel hour, enough to OOM the
-            # gateway on an input the 512 MiB import cap admits (GPT review
-            # r23). And the bound must be BYTES, not seconds: a frame is
-            # ``channels * 2`` bytes, so a fixed frame count lets the channel
+            # gateway on an input the 512 MiB import cap admits. And the bound
+            # must be BYTES, not seconds: a frame is ``channels * 2`` bytes,
+            # so a fixed frame count lets the channel
             # count scale the transient without limit — a valid 256-channel
             # minute under the same cap would make a "60-second" slice
-            # allocate ~0.5 GiB raw plus its float32 conversion (GPT review
-            # r34). 8 MiB of raw int16 per slice keeps the transient under a
+            # allocate ~0.5 GiB raw plus its float32 conversion.
+            # 8 MiB of raw int16 per slice keeps the transient under a
             # few tens of MiB for ANY channel count, while the result stays
             # the same: the per-frame mean is local to each frame, and
             # ``readframes`` counts whole frames, so no frame is ever split
@@ -2129,7 +2129,7 @@ async def _pcm_via_ffmpeg(audio_path: str, timeout_secs: int) -> np.ndarray | No
         # the exception itself still reaches the awaiter.
         rm = asyncio.ensure_future(asyncio.to_thread(_unlink_if_exists, tmp_wav))
         try:
-            # The authenticated handle must outlive the spawn (#8918): every
+            # The authenticated handle must outlive the spawn: every
             # path reaching this ``finally`` has already reaped the child
             # (``communicate`` on success and on a nonzero exit, kill-and-reap
             # on timeout and on cancellation) or never spawned one, so the

@@ -346,7 +346,7 @@ def repair_sentinel_path(raw: str) -> str:
     2. **Re-home a STRANDED legacy-rooted path.** A path under ``~/.kirocrew``
        is rewritten onto the resolved current home. The migration relocated the
        whole tree wholesale, so the tail after the home prefix is still correct.
-       Gated on the sentinel's directory no longer existing: an absolute
+       Gated on the sentinel's directory not existing: an absolute
        ``workspaces.<name>.dir`` may legitimately live inside that tree (and the
        legacy root can survive as debris), and rewriting a live path would move
        a working kill switch outside its configured workspace and persist that.
@@ -519,11 +519,11 @@ class NudgeLoop:
     #: Whether this loop may be observation-gated. Defaults to FALSE, which is what
     #: a record stored before this field existed decodes to.
     #:
-    #: THE PRINCIPLE, stated once because four review rounds circled it: gating is
+    #: THE PRINCIPLE, stated once: gating is
     #: the state that can silently stop work -- a gated loop whose subject is merged
     #: or closed DEACTIVATES -- so every uncertainty resolves to UNGATED, and only an
     #: explicit boolean true gates. An absent key is a loop nobody chose to gate,
-    #: usually a generic goal loop that predates the feature; a corrupt value is not
+    #: usually a generic goal loop armed without the field; a corrupt value is not
     #: a decision either. Being wrong in this direction costs a turn per interval,
     #: which is what today already costs. Being wrong the other way stops a
     #: recurring task because its instruction happened to mention a pull request.
@@ -820,10 +820,11 @@ class AutoNudgeService:
                 # asked not to be. Normalise it here, at the boundary, rather than
                 # hardening each read site.
                 # PRESENT-AND-NOT-A-BOOL, which includes ``null``, normalised to
-                # FALSE. Round 8 normalised it to True on the grounds that reading
-                # corrupt data as an opt-out would ungate loops nobody chose to
-                # ungate. That had the asymmetry backwards: gating is the state that
-                # can silently STOP a loop, so an unreadable value must resolve to
+                # FALSE. Normalising it to True instead -- on the grounds that
+                # reading corrupt data as an opt-out would ungate loops nobody
+                # chose to ungate -- has the asymmetry backwards: gating is the
+                # state that can silently STOP a loop, so an unreadable value
+                # must resolve to
                 # ungated -- costing a turn per interval, which is today's cost --
                 # rather than to gated, which can deactivate a recurring task whose
                 # instruction merely mentioned a pull request. Only an explicit
@@ -958,12 +959,11 @@ class AutoNudgeService:
                         loop.next_due_ts = 0.0
                         self._store_dirty = True
                     # A current, un-claimed, unsettled monitor keeps its active
-                    # intent and re-arms like any other loop. It used to be
-                    # deactivated here because delivery had no gate and the
-                    # legacy timer would have injected a prompt without a
-                    # decision; the gate in _monitor_tick_is_quiet now makes that
-                    # decision on every tick, so surviving a restart is correct
-                    # rather than a hazard. Deactivating instead would end every
+                    # intent and re-arms like any other loop. Delivery is gated in
+                    # _monitor_tick_is_quiet, which makes that decision on every
+                    # tick, so surviving a restart is correct rather than a
+                    # hazard: an ungated timer would inject a prompt with no
+                    # decision behind it. Deactivating instead would end every
                     # watch at the next gateway restart -- silently, since a
                     # stopped watch and a quiet one look identical from outside.
                 # Re-home / re-validate the persisted kill-switch path. A loop
@@ -1152,7 +1152,7 @@ class AutoNudgeService:
         # the old complete file or the new complete file, never a partial one.
         # The rename goes through replace_with_retry because on Windows it can
         # fail with PermissionError while another handle is transiently open on
-        # the fresh temp file (indexer / AV), which loses the write (issue #1105).
+        # the fresh temp file (indexer / AV), which loses the write.
         # Blocking (fsync) — async callers offload this to an executor.
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, suffix=".tmp")
@@ -1672,18 +1672,15 @@ class AutoNudgeService:
                 # The SUBJECT is decided HERE, from the instruction the caller
                 # already wrote -- no target, kind or enable flag is ever passed.
                 # WHETHER to look for one is the ``gate`` argument above, which the
-                # arming surfaces set and this service defaults to False; saying
-                # "rather than from a parameter" was true before that default moved
-                # and is not any more. What has never been a parameter, and is the
-                # point, is the subject: every earlier attempt at this saving
-                # shipped as an opt-in and measured zero adoption -- the switch
-                # existed, the agent arming the loop was mid-task, and nothing made
+                # arming surfaces set and this service defaults to False. What is
+                # never a parameter, and is the point, is the subject: an opt-in
+                # switch for this saving measures zero adoption -- the switch
+                # exists, the agent arming the loop is mid-task, and nothing makes
                 # it worth its five steps. There is no SUBJECT parameter to forget
                 # here: whatever the caller already wrote is where the target comes
-                # from, on every surface. Gating itself is no longer inherited by
-                # construction, though -- that claim was true before the default
-                # moved and is not now. Each arming surface chooses: monitor_start's
-                # directive gates by default, the generic REST route does not.
+                # from, on every surface. Gating itself is NOT inherited by
+                # construction: each arming surface chooses, and monitor_start's
+                # directive gates by default while the generic REST route does not.
                 #
                 # ``gate=False`` is the one escape, and it is an opt-OUT of a
                 # default that lives at the ARMING SURFACE: monitor_start's own
@@ -1790,7 +1787,7 @@ class AutoNudgeService:
         ``update(active=False)`` deliberately does not cancel a timer already
         inside its fire callback because channel turns run inline there.  A
         cleanup caller has a different need: it must know that a dashboard fire
-        can no longer materialize a slot after the caller takes its snapshot.
+        cannot materialize a slot after the caller takes its snapshot.
         The loop remains durably present and inactive until the caller removes
         it, so a timeout or process exit leaves a restart-visible recovery
         marker instead of losing the orphan's only identity.
@@ -1908,7 +1905,7 @@ class AutoNudgeService:
                     # fresh one -- refining the wording of an instruction about the
                     # same PR is the common use of this path, and rebuilding would
                     # discard the metering counters and the follow-up allowance for
-                    # no reason. A message that no longer names one subject clears
+                    # no reason. A message that names no single subject clears
                     # the monitor, which returns the loop to a plain timer.
                     #
                     # A loop armed with gate=False is never re-inferred here. Its
@@ -3077,7 +3074,7 @@ class AutoNudgeService:
         """Record that a tool approval in *slot_key* went unanswered.
 
         Called from the approval path when a prompt times out with no decision.
-        That is the only evidence available that an unattended loop can no longer
+        That is the only evidence available that an unattended loop cannot
         act, and it is evidence rather than inference: an auto-approved tool
         never reaches the interactive wait, so this is unreachable for a loop
         whose cycles only touch read-only tools.
@@ -3329,9 +3326,9 @@ class AutoNudgeService:
         out or is cancelled on a path that skips it, or the deferred re-arm was
         dropped by ``notify_user_input`` during the fire window -- the loop is
         left persisted ``active=true`` with a finished (or missing) timer task
-        and nothing on a timer ever revives it. The only rescues used to be a
-        gateway restart or a genuine turn completing in that exact slot. This
-        task is the general backstop: it re-arms toward the loop's own
+        and nothing on a timer ever revives it. Without this task the only
+        rescues are a gateway restart or a genuine turn completing in that
+        exact slot. It is the general backstop: it re-arms toward the loop's own
         persisted deadline, so a rescue never fires earlier than the schedule
         the user set (``_arm_from_deadline`` self-heals a cleared deadline into
         a fresh full countdown).
@@ -3521,10 +3518,10 @@ class AutoNudgeService:
             # already in progress, which is why it skips observation -- but a subject
             # with terminal debt is FINISHED, so there is no in-progress work to
             # protect, and the retry's correctness depends on it still being finished.
-            # Skipping the poll here is what let a REOPENED pull request keep its stale
-            # debt: the clearing added for that case lives after the poll, so the
-            # bypass jumped straight over it and the retried delivery settled a
-            # terminal state that no longer held. Re-observing costs one probe call on
+            # Skipping the poll here would let a REOPENED pull request keep its stale
+            # debt: the clearing for that case lives after the poll, so a bypass
+            # jumps straight over it and the retried delivery settles a terminal
+            # state that has stopped holding. Re-observing costs one probe call on
             # a path that is already firing a turn.
             monitor.followup_ticks -= 1
             self._persist_soon()
@@ -3722,9 +3719,8 @@ class AutoNudgeService:
                 loop.id,
                 ",".join(verdict.keys) or "unattributed",
             )
-            # SERIALIZED against ``update``. Round 13 removed this path's own second
-            # await; this closes the other side of the same race, which is
-            # ``update``'s. That method takes the MAINTENANCE lock (not ``_lock``)
+            # SERIALIZED against ``update``, which is the other side of the same
+            # race. That method takes the MAINTENANCE lock (not ``_lock``)
             # and awaits inside it, so a retarget could pass its precheck, yield,
             # let this branch settle the OLD subject with ``active = False``, and
             # then bind the NEW subject onto that inactive loop -- a fresh watch
@@ -3847,15 +3843,15 @@ class AutoNudgeService:
                     await self._write_monitor_snapshot_locked()
             except Exception:
                 # NOT rolled back -- and there is deliberately no saved copy to roll
-                # back TO. Round 31 restored the debt here to keep memory and disk in
-                # agreement, which is the right instinct almost everywhere and the
-                # wrong one here: a trustworthy live observation has just DISPROVED
-                # the debt, so restoring it lets the next delivered turn settle a
-                # terminal state that no longer holds and silently stop a watch whose
+                # back TO. Restoring the debt to keep memory and disk in agreement is
+                # the right instinct almost everywhere and the wrong one here: a
+                # trustworthy live observation has just DISPROVED the debt, so
+                # restoring it lets the next delivered turn settle a terminal state
+                # that has stopped holding and silently stop a watch whose
                 # subject is alive. The divergence is safe in exactly one direction --
                 # memory saying "no debt" keeps the watch running, and if the process
                 # restarts before the write lands, the disk's stale debt comes back and
-                # the tick RE-OBSERVES it (an outstanding debt no longer spends the
+                # the tick RE-OBSERVES it (an outstanding debt does not spend the
                 # observation-free follow-up tick), which clears it again. So the
                 # failure path converges instead of stopping work.
                 logger.exception(
@@ -3986,12 +3982,11 @@ class AutoNudgeService:
             logger.info("AutoNudge: loop %s reached max_cycles — deactivating", loop.id)
             await self.update(loop.id, active=False, stopped_reason="cycle_cap")
             # Signal the cap. Reaching max_cycles is NOT a successful finish —
-            # the loop ran out of cycles with its goal possibly unmet — yet the
-            # only trace used to be this log line plus an ``updated`` event
-            # indistinguishable from a user pressing Stop. A capped-out babysit
-            # was therefore impossible to tell apart from the agent stopping on
-            # its own. ``expired`` is emitted so an observer can raise a
-            # notification the user actually sees.
+            # the loop ran out of cycles with its goal possibly unmet — yet a log
+            # line plus an ``updated`` event is indistinguishable from a user
+            # pressing Stop, which leaves a capped-out babysit impossible to tell
+            # apart from the agent stopping on its own. ``expired`` is emitted so
+            # an observer can raise a notification the user actually sees.
             #
             # Emitted AFTER update() (which already persisted active=False and
             # emitted ``updated``), so a subscriber handling ``expired`` always
@@ -4017,7 +4012,8 @@ class AutoNudgeService:
             self._emit("expired", loop)
             return
         # Proved unable to act? Checked LAST, so a loop that is also out of
-        # cycles or budget still reports the bound it historically would have. This one is reactive by construction: it fires only on recorded
+        # cycles or budget still reports that bound instead. This one is reactive
+        # by construction: it fires only on recorded
         # evidence that a cycle's approval went unanswered (see
         # ``notify_approval_stalled``), never on a reading of whether a grant
         # happens to be in force — a loop that only ever calls auto-approved
@@ -4133,8 +4129,8 @@ class AutoNudgeService:
         Used only where a settlement is about to deactivate a loop, because that is the
         one action here that stops work silently. The answer is deliberately asymmetric:
         only a fresh terminal that CARRIES THE SAME CLASSIFICATION returns True, so an
-        unobservable subject -- a failed fetch, a probe defect, a binding that no longer
-        resolves -- keeps the watch alive rather than letting an absence of evidence
+        unobservable subject -- a failed fetch, a probe defect, a binding that does
+        not resolve -- keeps the watch alive rather than letting an absence of evidence
         retire it.
 
         Matching the classification matters as much as matching the outcome. A pull
@@ -4315,9 +4311,9 @@ class AutoNudgeService:
                     if settle_now and monitor is not None:
                         if not await self._terminal_still_holds(loop, monitor):
                             # The subject came back while the turn was being delivered.
-                            # Every earlier guard for a reopened subject lives on the
-                            # NEXT TICK -- the debt clearing added in round 31, the
-                            # forced re-observation added in round 34 -- and this
+                            # Every other guard for a reopened subject -- the debt
+                            # clearing, the forced re-observation -- lives on the
+                            # NEXT TICK, and this
                             # settlement runs before any tick can happen, so the window
                             # between the terminal observation and the turn landing had
                             # no evidence in it at all. A channel turn runs inline and
@@ -4332,8 +4328,8 @@ class AutoNudgeService:
                             #
                             # SKIPPED, not returned from. This block's own comment forbids
                             # an early exit because the rest of the fire cycle still has
-                            # to run, and round 35 was that exact rule being broken by a
-                            # re-raise leaving through the same door.
+                            # to run, and a re-raise leaving through the same door
+                            # breaks that rule just as an early return would.
                             monitor.terminal_pending = ""
                             self._persist_soon()
                             logger.info(
@@ -4375,7 +4371,7 @@ class AutoNudgeService:
                         except asyncio.CancelledError:
                             # Committed before the cancellation propagates, so the
                             # user must hear it now or never -- a restart reads the
-                            # loop as settled and no longer owes a turn.
+                            # loop as settled and does not owe a turn.
                             self._emit("expired", loop)
                             raise
                         except Exception:
@@ -4457,9 +4453,9 @@ class AutoNudgeService:
         # cannot be clobbered by a concurrent update()'s snapshot (and so the
         # fsync stays off the event loop).
         await self._persist_locked()
-        # At INFO, deliberately. Delivered fires used to be unlogged entirely,
-        # so a loop that died and a loop with nothing to report were
-        # byte-identical in the journal. One line per DELIVERED turn -- each of
+        # At INFO, deliberately. With delivered fires unlogged, a loop that died
+        # and a loop with nothing to report are byte-identical in the journal.
+        # One line per DELIVERED turn -- each of
         # which already spends a model turn, so the log can never outpace the
         # work -- is what makes both this loop's health and the reconciler's
         # rescues observable from outside the process.
@@ -4567,8 +4563,8 @@ class AutoNudgeService:
         after restart, never a premature or dropped fire"), and a far better trade
         than a sixth guard on an uncloseable window.
 
-        The countdown reset issue #8212 asks for is UNAFFECTED, because it never
-        came from this write: a delivered cycle clears ``next_due_ts`` in
+        The countdown reset is UNAFFECTED, because it never came from this write:
+        a delivered cycle clears ``next_due_ts`` in
         :meth:`_run_fire_cycle` and the re-arm then starts a fresh full interval.
         """
         loop = self.get_by_id(loop_id)
