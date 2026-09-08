@@ -311,16 +311,12 @@ class TestThemeInstallGate:
 
     def test_default_ungoverned_permits(self):
         _install(None)
-        d = gp.governance_permits(
-            "capabilities.theme_install", "", log_warning=False
-        )
+        d = gp.governance_permits("capabilities.theme_install", "", log_warning=False)
         assert d.permitted
 
     def test_policy_present_but_silent_permits(self):
         _install({"version": 1, "boot": {"fail_closed": True}})
-        d = gp.governance_permits(
-            "capabilities.theme_install", "", log_warning=False
-        )
+        d = gp.governance_permits("capabilities.theme_install", "", log_warning=False)
         assert d.permitted
 
     def test_policy_disabled_blocks(self):
@@ -333,9 +329,7 @@ class TestThemeInstallGate:
                 "capabilities": {"theme_install": {"enabled": False}},
             }
         )
-        d = gp.governance_permits(
-            "capabilities.theme_install", "", log_warning=False
-        )
+        d = gp.governance_permits("capabilities.theme_install", "", log_warning=False)
         assert not d.permitted
 
     def test_evaluation_error_fails_closed(self, monkeypatch):
@@ -1031,6 +1025,38 @@ class TestFilesystemEgressAtGate:
         )
         assert allowed.action != TOOL_DENY
 
+    def test_filesystem_write_denied_via_diff_only_edit(self):
+        # The same confinement must bind an edit whose target is named ONLY in
+        # the diff content block (event.diff_path): governance classifies the
+        # params-union-diff-block target set, so a diff-only edit outside the
+        # allow-list is denied rather than reaching the ceiling pathless.
+        _install(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "filesystem": {"write": {"mode": "allow", "allow": ["/home/u/workspace/**"]}},
+            }
+        )
+        from kiro_crew.hooks import TOOL_DENY, HookManager
+
+        hooks = HookManager()
+        denied = hooks.on_tool_call(
+            "code",
+            session_key="cli_chat",
+            tool_kind="edit",
+            raw_params={"command": "create", "fileText": "x"},
+            diff_path="/etc/passwd",
+        )
+        assert denied.action == TOOL_DENY
+        allowed = hooks.on_tool_call(
+            "code",
+            session_key="cli_chat",
+            tool_kind="edit",
+            raw_params={"command": "create", "fileText": "x"},
+            diff_path="/home/u/workspace/site.py",
+        )
+        assert allowed.action != TOOL_DENY
+
     def test_filesystem_write_traversal_escape_denied(self):
         # A ``..`` traversal that lexically escapes the allow-prefix must be
         # DENIED: without path normalization, fnmatch's ``*`` spans the ``..`` so
@@ -1348,9 +1374,7 @@ class TestFilesystemEgressAtGate:
             "fs_read",
             session_key="cli_chat",
             tool_kind="read",
-            raw_params={
-                "operations": [{"mode": "Line", "path": self._fs_tree("ws", "doc.md")}]
-            },
+            raw_params={"operations": [{"mode": "Line", "path": self._fs_tree("ws", "doc.md")}]},
         )
         assert allowed.action != TOOL_DENY
 
@@ -1796,7 +1820,9 @@ class TestGovernanceDegradedIsObservable:
 
             sel_file = sel_dir / "security_events.jsonl"
             records = [
-                json.loads(line) for line in sel_file.read_text(encoding="utf-8").splitlines() if line.strip()
+                json.loads(line)
+                for line in sel_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
             ]
             degraded = [r for r in records if r.get("event_type") == "governance_degraded"]
             assert degraded, "a governance_degraded SEL record must be persisted"
