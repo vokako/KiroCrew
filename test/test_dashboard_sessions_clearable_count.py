@@ -101,6 +101,13 @@ def _fake_state(
     state = MagicMock()
     state.conversation_log = conv_log
     state._slots = slots or {}
+    # No cron store, not a mock one: these tests compare what the SELECTOR counts
+    # against what the delete removes, and the cron-ownership sweep is a separate
+    # concern (test_remove_slot_for_history_key.py). A bare MagicMock is worse
+    # than None here -- `await state.crons.owner_keys_async()` raises TypeError,
+    # which the funnel correctly reads as an unseeable store and refuses on, so
+    # the comparison would fail for an unrelated reason.
+    state.crons = None
     state.push_slots_update = MagicMock()
     state.push_refresh = MagicMock()
     return state, deleted_keys

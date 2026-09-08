@@ -1281,6 +1281,12 @@ class TestOnLoopCallersOffload:
 
         state = MagicMock()
         state.conversation_log = log
+        # No cron store: this test asserts the delete's blocking work runs OFF the
+        # event loop, not anything about cron ownership. A bare MagicMock would
+        # make `await state.crons.owner_keys_async()` raise TypeError, which the
+        # funnel reads as an unseeable store and refuses on -- so the delete never
+        # runs and there is no thread to observe.
+        state.crons = None
         state.push_slots_update = MagicMock()
         state.push_refresh = MagicMock()
         monkeypatch.setattr(
@@ -1405,7 +1411,13 @@ class TestDashboardSaveHoldsLock:
         return DashboardState(
             sessions=sessions,
             crons=MagicMock(
-                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+                list_jobs=MagicMock(return_value=[]),
+                status=MagicMock(return_value={}),
+                # The owner sweep's only read, and it must be a real coroutine:
+                # an auto-mocked attribute returns a non-awaitable MagicMock, and
+                # the funnel reads that failure as an unseeable store and refuses
+                # the delete. An empty owner set is the real store's answer here.
+                owner_keys_async=AsyncMock(return_value=set()),
             ),
             lessons=MagicMock(load_all=MagicMock(return_value=[])),
             start_time=0.0,
@@ -1737,7 +1749,13 @@ class TestForeignFoldMidIdentity:
         return DashboardState(
             sessions=sessions,
             crons=MagicMock(
-                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+                list_jobs=MagicMock(return_value=[]),
+                status=MagicMock(return_value={}),
+                # The owner sweep's only read, and it must be a real coroutine:
+                # an auto-mocked attribute returns a non-awaitable MagicMock, and
+                # the funnel reads that failure as an unseeable store and refuses
+                # the delete. An empty owner set is the real store's answer here.
+                owner_keys_async=AsyncMock(return_value=set()),
             ),
             lessons=MagicMock(load_all=MagicMock(return_value=[])),
             start_time=0.0,
@@ -2075,7 +2093,13 @@ class TestBestEffortSaveMarksDirty:
         return DashboardState(
             sessions=sessions,
             crons=MagicMock(
-                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+                list_jobs=MagicMock(return_value=[]),
+                status=MagicMock(return_value={}),
+                # The owner sweep's only read, and it must be a real coroutine:
+                # an auto-mocked attribute returns a non-awaitable MagicMock, and
+                # the funnel reads that failure as an unseeable store and refuses
+                # the delete. An empty owner set is the real store's answer here.
+                owner_keys_async=AsyncMock(return_value=set()),
             ),
             lessons=MagicMock(load_all=MagicMock(return_value=[])),
             start_time=0.0,

@@ -124,6 +124,15 @@ def _make_request(
     state = MagicMock()
     state.conversation_log = conv_log
     state._slots = slots or {}
+    # No cron store, not a mock one. These tests are about which history rows the
+    # clear SELECTS, and the cron-ownership sweep is a separate concern with its
+    # own module (test_remove_slot_for_history_key.py). A bare MagicMock here is
+    # actively misleading: `await state.crons.owner_keys_async()` raises
+    # TypeError, which the funnel must read as "the store could not be seen" and
+    # refuse the delete -- so every scoping assertion below would fail for a
+    # reason that has nothing to do with scoping. None is the honest stand-in:
+    # nothing to sweep, nothing withheld.
+    state.crons = None
     state.push_slots_update = MagicMock()
     state.push_refresh = MagicMock()
 
