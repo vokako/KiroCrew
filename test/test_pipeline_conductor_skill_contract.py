@@ -24,23 +24,30 @@ couple this file to that one for no additional coverage.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from pathlib import Path
 
 from skill_script_helpers import load_skill_script
 
-from kiro_crew import agent
+from kiro_crew import agent, hooks
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "pipeline-conductor"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 DESIGN_DOC = REPO_ROOT / "docs" / "request-for-change" / "rfc-pipeline-conductor.md"
 
-#: The three scripts the procedure delegates its deterministic half to. Named
+#: The scripts the procedure delegates its deterministic half to. Named
 #: here rather than globbed from the directory on purpose: the point is that the
 #: PROSE cites each one, and a glob would pass on a skill body that mentions
 #: none of them.
-BUNDLED_SCRIPTS = ("claim_preflight.py", "fleet_probe.py", "credit_spend.py")
+BUNDLED_SCRIPTS = (
+    "claim_preflight.py",
+    "fleet_probe.py",
+    "credit_spend.py",
+    "spec_check.py",
+)
 
 
 def _read(path: Path) -> str:
@@ -288,6 +295,213 @@ class TestPodReproAdmissionGate:
         assert "worktree's `./.venv/bin/kirocrew`" in brief
         assert "repository's own playwright runner" in brief
         assert "missing required engine" in brief
+
+
+class TestSpecCheckRefusesAnUndeclaredGate:
+    """A two-value field is only two-valued if something refuses a third value.
+
+    ``verifier.repro_gate`` was documented as an enum and enforced by nothing: a
+    value outside the declared set matches neither branch of the procedure, so
+    ``pod_required``'s admission gate never engages while the spec file says it
+    is on, the generic implementation instructions stay reachable, and the
+    campaign metric still counts the run as pod-verified. That is the gate's own
+    failure mode reintroduced one level down, which is why the check refuses the
+    run rather than falling back to ``best_effort``.
+    """
+
+    @staticmethod
+    def _script():
+        return load_skill_script("spec_check", SKILL_DIR / "scripts" / "spec_check.py")
+
+    def test_a_misspelled_gate_is_refused_by_name_value_and_option_set(self):
+        problem = self._script().spec_error({"verifier": {"repro_gate": "pod-required"}})
+        assert problem is not None
+        # The operator has to be able to act on the message without opening the
+        # spec's documentation: which field, what it read, what it accepts.
+        assert "verifier.repro_gate" in problem
+        assert "pod-required" in problem
+        assert "best_effort" in problem
+        assert "pod_required" in problem
+
+    def test_both_declared_values_are_accepted(self):
+        spec_error = self._script().spec_error
+        for value in ("best_effort", "pod_required"):
+            assert spec_error({"verifier": {"repro_gate": value}}) is None, value
+
+    def test_an_omitted_gate_takes_the_documented_default(self):
+        """Omission is how a pipeline asks for the default, so it is not an
+        error -- otherwise every pre-existing spec stops running."""
+        spec_error = self._script().spec_error
+        assert spec_error({}) is None
+        assert spec_error({"verifier": {}}) is None
+
+    def test_a_non_string_gate_is_refused_rather_than_coerced(self):
+        """An explicit ``null`` is a value, not an omission, and truthiness
+        coercion is how ``0`` or ``[]`` would silently select a branch."""
+        spec_error = self._script().spec_error
+        for value in (None, 0, True, [], {}, "BEST_EFFORT", ""):
+            assert spec_error({"verifier": {"repro_gate": value}}) is not None, value
+
+    def test_a_scalar_verifier_block_is_refused(self):
+        """A block spelled as a scalar hides every field under it, so the enum
+        would read as absent and default -- the same silent outcome."""
+        problem = self._script().spec_error({"verifier": "pod_required"})
+        assert problem is not None
+        assert "verifier" in problem
+
+    def test_the_cli_exits_two_on_a_misspelled_gate_and_zero_on_a_valid_one(self, tmp_path, capsys):
+        script = self._script()
+        bad = tmp_path / "bad-spec.json"
+        bad.write_text(json.dumps({"verifier": {"repro_gate": "pod-required"}}), encoding="utf-8")
+        assert script.main(["--spec", str(bad)]) == 2
+        assert "malformed spec" in capsys.readouterr().err
+
+        good = tmp_path / "good-spec.json"
+        good.write_text(json.dumps({"verifier": {"repro_gate": "pod_required"}}), encoding="utf-8")
+        assert script.main(["--spec", str(good)]) == 0
+
+    def test_an_unreadable_or_non_object_spec_refuses_the_run(self, tmp_path):
+        script = self._script()
+        assert script.main(["--spec", str(tmp_path / "absent.json")]) == 2
+        listy = tmp_path / "listy.json"
+        listy.write_text("[]", encoding="utf-8")
+        assert script.main(["--spec", str(listy)]) == 2
+
+    def test_the_accepted_set_reads_as_a_sentence_at_any_arity(self):
+        """The message is the whole remedy an operator gets, so its rendering is
+        part of the contract rather than cosmetic: a bare tuple repr is what sends
+        someone back to the documentation to find out what to type."""
+        expected = self._script()._expected
+        assert expected(("only",)) == "'only'"
+        assert expected(("best_effort", "pod_required")) == "'best_effort' or 'pod_required'"
+        assert expected(("a", "b", "c")) == "'a', 'b', or 'c'"
+
+    def test_the_prose_declares_exactly_the_values_the_script_accepts(self):
+        """The value set is read from the SCRIPT, not restated here. Two copies
+        of one fact drift, and the drift is invisible: the prose is what the
+        operator writes the spec from, the script is what refuses it."""
+        allowed = self._script()._ENUMS["verifier.repro_gate"]
+        spec = _flat(_skill_section("## The pipeline spec"))
+        for value in allowed:
+            assert f"`{value}`" in spec, value
+
+    def test_startup_runs_the_check_before_it_dispatches_anything(self):
+        startup = _flat(_skill_section("## Startup (once per run)"))
+        assert "spec_check.py" in startup
+        assert "refusal to start" in startup
+
+
+class TestSpecCheckReadsThroughTheSensitivePathGate:
+    """The spec path is operator-supplied, so the read is a gated read.
+
+    ``--spec`` comes from the seed message, which makes it caller-influenced: a
+    symlink there could aim the validator at a credential store the sandbox
+    leaves readable, and the script would open it with the operator's own
+    permissions. Reading through ``safe_read_file`` puts the resolved target
+    behind ``is_sensitive_path`` and opens it ``O_NOFOLLOW``, so the gate holds
+    through the link and through a TOCTOU swap of the final component.
+
+    Each case below writes a spec whose CONTENT would produce a *different*
+    message if the gate were bypassed (a bad ``repro_gate`` value, which the
+    validator reports by name). So a passing test proves the file was refused
+    rather than merely proving some non-zero exit.
+
+    The fixture does NOT relocate ``HOME``. Re-anchoring the home directory into
+    ``tmp_path`` would make the planted tree *be* the sensitive location, so the
+    tests would pass without the real credential-boundary classification ever
+    running -- they would be checking the fixture. Instead exactly one planted
+    path is declared sensitive and every other path DELEGATES to the real
+    ``is_sensitive_path``, so the production boundary logic still decides the
+    ordinary-spec cases and a regression in it is not masked.
+    """
+
+    @staticmethod
+    def _script():
+        return load_skill_script("spec_check", SKILL_DIR / "scripts" / "spec_check.py")
+
+    @staticmethod
+    def _plant_credential_store(monkeypatch, root):
+        """Plant a credential store and classify ONLY it as sensitive.
+
+        Returns the planted path. ``safe_read_file`` calls the bare
+        ``is_sensitive_path`` name out of ``kiro_crew.hooks``' module globals, so
+        patching the attribute there intercepts the real call site rather than a
+        copy. The wrapper compares canonical paths, which is what makes the
+        symlink case meaningful: the link resolves to the planted target.
+        """
+        aws = root / ".aws"
+        aws.mkdir(parents=True)
+        cred = aws / "credentials"
+        # Valid JSON carrying a bad gate value: bypassing the read gate yields
+        # "malformed spec: verifier.repro_gate ...", never a refusal.
+        cred.write_text(json.dumps({"verifier": {"repro_gate": "pod-required"}}), encoding="utf-8")
+
+        real_is_sensitive_path = hooks.is_sensitive_path
+        planted = os.path.realpath(str(cred))
+
+        def classify(path_str, *args, **kwargs):
+            if os.path.realpath(os.path.expanduser(str(path_str))) == planted:
+                return True
+            # Everything else is the real gate's call, so the ordinary-spec
+            # assertions below are answered by production code.
+            return real_is_sensitive_path(path_str, *args, **kwargs)
+
+        monkeypatch.setattr(hooks, "is_sensitive_path", classify)
+        return cred
+
+    def test_a_spec_path_inside_a_credential_store_is_refused_not_parsed(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        cred = self._plant_credential_store(monkeypatch, tmp_path)
+        assert self._script().main(["--spec", str(cred)]) == 2
+        err = capsys.readouterr().err
+        assert "refused spec" in err
+        assert "sensitive path" in err
+        # The discriminator: the validator never got to look at the content.
+        assert "repro_gate" not in err
+
+    def test_a_symlinked_spec_is_refused_through_the_link(self, tmp_path, capsys, monkeypatch):
+        """The attack shape: an innocuous-looking `spec.json` whose target is the
+        credential store. Checking the link's own path would pass it."""
+        cred = self._plant_credential_store(monkeypatch, tmp_path)
+        link = tmp_path / "spec.json"
+        link.symlink_to(cred)
+        assert self._script().main(["--spec", str(link)]) == 2
+        err = capsys.readouterr().err
+        assert "refused spec" in err
+        # Named by RESOLVED target, so the refusal says what it actually blocked.
+        assert ".aws" in err
+        assert "repro_gate" not in err
+
+    def test_an_ordinary_spec_beside_the_store_still_validates(self, tmp_path, capsys, monkeypatch):
+        """The gate must not cost the tool its job: a normal spec beside the
+        credential store reads and validates as before. This is the case the real
+        ``is_sensitive_path`` answers -- the wrapper delegates it."""
+        self._plant_credential_store(monkeypatch, tmp_path)
+        spec = tmp_path / "pipeline-spec.json"
+        spec.write_text(json.dumps({"verifier": {"repro_gate": "pod_required"}}), encoding="utf-8")
+        assert self._script().main(["--spec", str(spec)]) == 0
+        assert "OK" in capsys.readouterr().out
+
+        bad = tmp_path / "typo-spec.json"
+        bad.write_text(json.dumps({"verifier": {"repro_gate": "pod-required"}}), encoding="utf-8")
+        assert self._script().main(["--spec", str(bad)]) == 2
+        assert "verifier.repro_gate" in capsys.readouterr().err
+
+    def test_an_unenforceable_gate_refuses_rather_than_reading_plainly(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A skill's scripts can run as bare files with ``kiro_crew`` off the
+        path. Degrading to ``read_text`` there would reintroduce the bypass in
+        the case least likely to be noticed, so absence of the gate is itself a
+        refusal."""
+        script = self._script()
+        monkeypatch.setattr(script, "safe_read_file", None)
+        spec = tmp_path / "pipeline-spec.json"
+        spec.write_text(json.dumps({"verifier": {"repro_gate": "pod_required"}}), encoding="utf-8")
+        assert script.main(["--spec", str(spec)]) == 2
+        err = capsys.readouterr().err
+        assert "cannot enforce the sensitive-path read gate" in err
 
 
 class TestProbeSignalsAreDocumented:
@@ -846,7 +1060,7 @@ class TestDesignDocTracksTheSkill:
         doc = _flat(_read(DESIGN_DOC))
         assert "admission is sized on delivery" in doc
 
-    def test_design_doc_names_all_three_scripts(self):
+    def test_design_doc_names_every_bundled_script(self):
         doc = _read(DESIGN_DOC)
         for script in BUNDLED_SCRIPTS:
             assert script in doc, script
