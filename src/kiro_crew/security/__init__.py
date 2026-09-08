@@ -630,9 +630,9 @@ def sanitized_oauth_endpoint(url: str) -> tuple[str, str] | None:
     """Best-effort ``(host, path)`` of an OAuth URL, safe to surface to users.
 
     :func:`oauth_url_contains_credential` answers only a boolean, so its
-    callers historically could not tell the user WHICH endpoint tripped the
-    scanner — the remedy (``oauth_endpoints.json``) needs an exact host+path to
-    be actionable. This sibling names the endpoint without weakening the
+    callers cannot tell the user WHICH endpoint tripped the scanner — and the
+    remedy (``oauth_endpoints.json``) needs an exact host+path to be
+    actionable. This sibling names the endpoint without weakening the
     rejection:
 
     * only the lowercase hostname and the path are returned — NEVER the query,
@@ -1094,8 +1094,8 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
             programs = _argv_programs(tokens) if payloads else []
             # Both values below read ONLY ``tokens``, which is fixed for this
             # whole walk, so they are charged ONCE here instead of once per
-            # payload.  Asking per payload is what made this loop quadratic in
-            # payload count (#8595 -- 18k payloads, ~293s): the exemption's
+            # payload.  Asking per payload is what makes this loop quadratic in
+            # payload count (18k payloads, ~293s): the exemption's
             # command-level guards sweep the whole argv, and recovering a
             # payload's positions with ``enumerate`` sweeps it again, so N
             # payloads cost N x len(tokens).  Neither hoist can change a verdict:
@@ -1785,9 +1785,8 @@ def _emit_deny_event(
         # credential straddling the 200-char boundary would otherwise be cut in half,
         # and the fragment no longer matches the credential pattern, so SEL's own
         # write-path redaction cannot catch it and the partial secret persists in a
-        # dashboard-readable log.  Both fields take it: ``raw_segment`` is new, and
-        # ``segment`` carried the same hazard from a bare slice (found by the GPT 5.6
-        # review lane on the new field).
+        # dashboard-readable log.  Both fields take it: a bare slice carries the
+        # same hazard in either one.
         metadata = {
             "deny_pattern": deny_pattern,
             "segment": redact_and_truncate(segment, 200) if segment else "",

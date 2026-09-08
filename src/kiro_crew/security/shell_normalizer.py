@@ -329,7 +329,7 @@ _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
 _EMPTY_SUBST_RE = re.compile(r"\$\(\s*\)|`\s*`|\$\{\s*\}")
 
 
-# than grown one spelling per review round, so the boundary is stated instead of implied:
+# than grown one spelling at a time, so the boundary is stated instead of implied:
 #
 #   DESCRIPTOR (optional prefix)  digits -- every shell
 #                                 ``&``    both streams (bash, zsh, ksh)
@@ -448,16 +448,16 @@ def _resolve_param_defaults(token: str) -> str:
 # ``-c`` may arrive inside a COMBINED short-flag cluster: ``bash -xc '<script>'``
 # and ``sh -ec '<script>'`` both run the next token as a script.  Matching only
 # the exact spellings ``-c``/``-lc`` leaves every other cluster as a bypass.
-# LOWERCASE only, deliberately: widening this class to ``[A-Za-z]`` made an
-# uppercase-clustered decoy (``-Cc``) the FIRST flag stop, which ate the stop
-# through which a following ``--command``'s payload was found (Opus review lane
-# on #8197).  Uppercase-clustered spellings are covered instead by
+# LOWERCASE only, deliberately: widening this class to ``[A-Za-z]`` makes an
+# uppercase-clustered decoy (``-Cc``) the FIRST flag stop, which eats the stop
+# through which a following ``--command``'s payload is found.
+# Uppercase-clustered spellings are covered instead by
 # ``_SHELL_COMMAND_GLUED_RE`` (glued) and the every-carrier sweep (spaced), so
-# the flag stop set stays byte-identical to what it always was.  The
+# the flag stop set stays as narrow as it can be.  The
 # protection is for the CASE-PRESERVING callers (the alt-traversal pass): the
 # deny tiers lowercase their input first, where ``-Cc`` folds to ``-cc`` and
-# eats the ``--command`` stop exactly as it always has -- a pre-existing
-# residual there, not one this pattern can close.
+# eats the ``--command`` stop -- a residual there, not one this pattern can
+# close.
 _SHELL_COMMAND_FLAG_RE = re.compile(r"\A-[a-z]*c[a-z]*\Z")
 
 
@@ -469,7 +469,7 @@ _SHELL_COMMAND_FLAG_RE = re.compile(r"\A-[a-z]*c[a-z]*\Z")
 # command could reach.  ``sh -c'rg . /path'`` reaches the token walk as
 # ``-crg . /path`` once ``shlex`` strips the quotes.  ``_SHELL_COMMAND_FLAG_RE``
 # anchors the WHOLE token as a bare flag cluster, so a token carrying the
-# payload's own characters was rejected and the payload never yielded (#8197).
+# payload's own characters is rejected there and the payload never yielded.
 # This companion pattern CAPTURES the glued remainder instead of weakening the
 # flag pattern where it is used for pure flag detection.  Non-greedy, so the
 # split happens at the FIRST lowercase ``c`` (``-ec'x'`` runs ``x`` under the
@@ -529,8 +529,8 @@ def _data_consumer_command_disqualified(tokens: "list[str]") -> bool:
     live in one function so a caller holding a fixed argv can charge them ONCE
     instead of once per candidate token: :func:`_data_consumer_exempt` is called
     per payload inside a loop over a fixed argv, and the ``_SCRIPT_EXECUTES_RE``
-    sweep below is itself O(len(tokens)), so re-asking made the enclosing walk
-    quadratic in payload count (#8595 -- 18k payloads, ~293s).
+    sweep below is itself O(len(tokens)), so re-asking makes the enclosing walk
+    quadratic in payload count (18k payloads, ~293s).
 
     Splitting them out cannot change any verdict: each is a pure function of
     *tokens* and each REFUSES the exemption, so hoisting alters only how often
@@ -760,10 +760,10 @@ def _is_herestring_token(token: str) -> bool:
     """True where the herestring scan in :func:`_nested_shell_payloads` stops.
 
     Covers the spaced operator and the operator glued to its payload.  A
-    SEPARATE stop from the command flag (they used to share one predicate):
-    with one shared table a herestring token EATS the stop through which a
-    later ``-c``'s payload was found -- ``bash <<<'x' -c '<script>'`` yielded
-    only ``x`` while a real shell runs the script.  Independent tables scan
+    SEPARATE stop from the command flag: with one shared table a herestring
+    token EATS the stop through which a later ``-c``'s payload is found --
+    ``bash <<<'x' -c '<script>'`` would yield only ``x`` while a real shell runs
+    the script.  Independent tables scan
     each spelling in its own right, which is purely additive.
     """
     return token == "<<<" or token.startswith("<<<")
@@ -1005,7 +1005,7 @@ def _substitution_depth_delta(token: str) -> int:
     indistinguishable from a real one here and a window bounded by this delta
     under-runs on decoyed input.  The bare-``kill`` window recovers by
     re-deriving its bodies from the raw text, where the quotes still exist
-    (:func:`_bare_kill_raw_bodies`, #8633).
+    (:func:`_bare_kill_raw_bodies`).
     """
     return token.count("$(") + token.count("`") // 2 - token.count(")")
 
@@ -1042,11 +1042,11 @@ def _substitution_bodies(text: str) -> "list[str]":
 
     The nesting walk is QUOTE-AWARE, through the same
     :func:`_matching_close_paren` span the git-publish boundary walk uses. A
-    private, quote-unaware copy of it truncated the body at a QUOTED ``)``, and
-    that lost the nested command entirely rather than merely mis-sizing the span:
-    ``git push origin my-feature > >(X=')' git push origin main)`` extracted the
-    body ``X='``, so the nested publish of a protected branch was never scanned
-    and ``is_denied`` returned None for a command bash executes. An UNPROVEN span
+    private, quote-unaware copy of it truncates the body at a QUOTED ``)``, and
+    that loses the nested command entirely rather than merely mis-sizing the span:
+    ``git push origin my-feature > >(X=')' git push origin main)`` extracts the
+    body ``X='``, so the nested publish of a protected branch is never scanned
+    and ``is_denied`` returns None for a command bash executes. An UNPROVEN span
     yields the whole remainder, which is the fail-closed direction -- scanning
     text that is not really in the body can only add findings.
     """
@@ -1218,8 +1218,9 @@ def _heredoc_marker(raw: str) -> "str | None":
 
     Read off the RAW token deliberately: ``_normalize_operand`` strips a redirection
     down to the empty string, which is why the heredoc branch in
-    :func:`_python_reads_stdin` was unreachable -- a bare ``python << 'PY' … PY`` was
-    misread as running a SCRIPT named by the first word of the body (#2660).  Shared
+    :func:`_python_reads_stdin` would otherwise be unreachable -- a bare
+    ``python << 'PY' … PY`` is misread as running a SCRIPT named by the first
+    word of the body.  Shared
     by the stdin DETECTOR and the program-text SCOPE so the two cannot disagree about
     where a heredoc body starts and ends.
     """
@@ -1483,16 +1484,14 @@ def _iter_shell_chars(text: str, state: int = 0, ansi: bool = False) -> "Iterato
     """THE shell quote/escape state machine. Every push-path reading of shell
     quoting walks through this one generator.
 
-    Four readings used to keep their own copy, and they did not agree. The word
-    splitter had no ANSI-C awareness while the boundary walk did, so in
-    ``git push origin feature > >(echo $'a\\'b') main`` the splitter read the
-    ESCAPED quote as a real closer, reopened on the next quote, and fused the
-    trailing ``main`` into one unterminated word -- the boundary walk then proved
-    its parenthesis correctly, but the protected refspec was already trapped
-    inside the word it had been handed. That is the same two-scanners defect this
-    module was already cured of twice (two tokenizers, then two paren counters),
-    so the cure is structural: one machine, several consumers, no second opinion
-    to drift from.
+    Four readings each keeping their own copy would not agree. A word splitter
+    with no ANSI-C awareness where the boundary walk has it reads the ESCAPED
+    quote in ``git push origin feature > >(echo $'a\\'b') main`` as a real
+    closer, reopens on the next quote, and fuses the trailing ``main`` into one
+    unterminated word -- the boundary walk then proves its parenthesis
+    correctly, but the protected refspec is already trapped inside the word it
+    was handed. That is the two-scanners defect this module is structurally
+    cured of: one machine, several consumers, no second opinion to drift from.
 
     Bash's rules, once: a backslash escapes the next character outside quotes,
     inside double quotes, and inside ``$'...'``, but is LITERAL inside a plain
@@ -1724,10 +1723,10 @@ def _push_token_shell_read(token: str) -> "tuple[list[str] | None, bool]":
 #: A token that BEGINS with a redirection: optional fd number, ``&``, or bash
 #: NAMED descriptor ``{name}`` prefix, then ``<`` or ``>`` (doubled, or ``>|``
 #: clobber, or ``>&``/``<&`` fd-dup). ``{name}>...`` is ALL redirection — read
-#: as a word, the ``{name}`` became a phantom refspec and erased every tag
-#: (GPT 5.6 round 11 on #7808). ``<<-`` (the tab-stripping heredoc) folds its
-#: ``-`` INTO the operator — left in the remainder it faked a self-contained
-#: token and the separated delimiter word became a phantom refspec (round 7)
+#: as a word, the ``{name}`` becomes a phantom refspec and erases every tag.
+#: ``<<-`` (the tab-stripping heredoc) folds its
+#: ``-`` INTO the operator — left in the remainder it fakes a self-contained
+#: token and the separated delimiter word becomes a phantom refspec
 #: — while a ``-`` after an fd-dup (``>&-`` close, ``2>&1-`` move) is a
 #: disposition the remainder correctly keeps. group(3) is whatever follows
 #: the operator run — an ATTACHED target/fd makes the token self-contained;
@@ -1743,13 +1742,13 @@ def _push_token_redirection(token: str) -> "tuple[bool, bool]":
     the prefix/operator span. The redirection operator grammar itself admits
     no quote characters, so a quote can only ever sit in the TARGET group:
     ``>'log'`` is a plain redirection with a quoted target, and refusing the
-    whole token for it pushed the shape into the fallback with the WRONG
-    catalog identity (GPT 5.6 round 11 on #7808). A token that is a fragment
+    whole token for it pushes the shape into the fallback with the WRONG
+    catalog identity. A token that is a fragment
     (open quote state / trailing escape) is still refused — the caller's walk
     poisons the split for those. The shell consumes a redirection before the
     program runs, so such a token is never an argv word — treating it as a
-    positional is how ``git push origin </dev/null`` erased the single-arg
-    tag (round 4, verified real and pre-existing on main).
+    positional is how ``git push origin </dev/null`` erases the single-arg
+    tag.
     """
     m = _PUSH_REDIRECTION_RE.match(token)
     if m is None:
@@ -1889,9 +1888,9 @@ _AMBIGUOUS_EXPANSION_RE = re.compile(r"\$\(|\$\{|`|\{[^{}]*(?:,|\.\.)[^{}]*\}")
 
 #: Process substitution, which the shell replaces with a ``/dev/fd`` path WORD.
 #: Read in a word position it is unverifiable — mis-reading it as a removable
-#: redirection shifted a value option's consumption onto the remote and
-#: downgraded a protected push to the disableable single-arg row (GPT 5.6 round 8
-#: on #7808). The operator adjacency is required, so a parenthesis inside a
+#: redirection shifts a value option's consumption onto the remote and
+#: downgrades a protected push to the disableable single-arg row.
+#: The operator adjacency is required, so a parenthesis inside a
 #: refname stays data; a QUOTED spelling still matches and over-denies, the same
 #: fail-closed posture the expansion regex takes for a quoted ``$(``.
 _PROCESS_SUBSTITUTION_OPENERS = ("<(", ">(")
@@ -1939,11 +1938,11 @@ def _split_shell_words(segment: str) -> list[str]:
 
     Quote state comes from :func:`_iter_shell_chars`, so ANSI-C ``$'...'`` reads
     the same here as everywhere else. A private copy of the state machine WITHOUT
-    that awareness is what let ``git push origin feature > >(echo $'a\\'b') main``
-    publish a protected branch: the escaped quote closed its state, the next quote
-    reopened it, and the trailing ``main`` fused into one unterminated word --
-    which the boundary walk, reading the same text correctly, could no longer
-    rescue because the refspec was already inside the word it was handed.
+    that awareness is what lets ``git push origin feature > >(echo $'a\\'b') main``
+    publish a protected branch: the escaped quote closes its state, the next quote
+    reopens it, and the trailing ``main`` fuses into one unterminated word --
+    which the boundary walk, reading the same text correctly, cannot
+    rescue because the refspec is already inside the word it was handed.
     """
     words: list[str] = []
     buf: list[str] = []
@@ -2248,8 +2247,8 @@ def _nested_shell_payloads(
     the watchdog to fire. Declining the second join costs no detection, because
     the join FUSES already-dequoted words in one step -- ``eval eval 'git' 'push
     origin main'`` is fused to ``git push origin main`` by the first join, so the
-    publish is visible at the first joined frame and the chain only re-derived
-    suffixes of an answer already in hand.
+    publish is visible at the first joined frame and the chain would only
+    re-derive suffixes of an answer already in hand.
     """
     payloads: list[str] = []
     # Both scans below look for the FIRST token after a program that satisfies a stop
@@ -2520,9 +2519,9 @@ def _shell_payload_walk(text_lower: str) -> "list[tuple[str, list[str]]]":
     consume this need different views of the same frame: the self-protection
     predicates match argv structurally, while the git-publish gate is a
     verb-anchored scan over command text.  Walking once and handing out both is
-    what keeps the two floors from drifting -- the publish gate previously did
-    its own top-level-only text match, so every wrapper form
-    (``bash -c '<push>'``, ``eval '<push>'``) bypassed the ONLY enforcement
+    what keeps the two floors from drifting -- a publish gate doing
+    its own top-level-only text match would let every wrapper form
+    (``bash -c '<push>'``, ``eval '<push>'``) bypass the ONLY enforcement
     pushes have.
 
     Descends to ANY depth.  A numeric depth cap is itself a bypass -- whatever the

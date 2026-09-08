@@ -7,16 +7,16 @@ forwards ACP frames to KAS in both directions, so Kiro Crew speaks ordinary ACP
 to a kiro-cli process and never touches KAS's bundle, its Node runtime, or its
 tokens.
 
-This replaces an earlier arrangement where Crew located kiro-cli's *extracted*
-KAS bundle itself and ran ``node .../acp-server.js --auth=acp-callback``. That
-worked, but it made Crew depend on kiro-cli's internal on-disk layout (a
+Crew does NOT locate kiro-cli's *extracted* KAS bundle itself and run
+``node .../acp-server.js --auth=acp-callback``. That works, but it makes Crew
+depend on kiro-cli's internal on-disk layout (a
 ``{data_dir}/kas/{version}-{hash}/node_modules/@kiro/agent/...`` path that
-kiro-cli is free to change) and it put Crew in the credential path: KAS asked
-Crew for a token over ``_kiro/auth/getAccessToken`` and Crew shelled out to a
+kiro-cli is free to change) and it puts Crew in the credential path: KAS asks
+Crew for a token over ``_kiro/auth/getAccessToken`` and Crew shells out to a
 hidden ``kiro-cli chat _ get-kas-token`` verb to answer. The relay owns both
-concerns, so neither belongs here any more.
+concerns, so neither belongs here.
 
-Frame parity between the two routes was measured before the switch, not assumed:
+Frame parity between the two routes is measured, not assumed:
 all forward methods Crew sends (``initialize``, ``session/new`` carrying
 ``_meta.kiro.customAgents``, ``session/set_mode``, ``session/prompt``,
 ``session/cancel``, ``session/load``, ``_kiro/session/delete``) behave
@@ -24,11 +24,11 @@ identically, and every reverse frame Crew consumes arrives unchanged --
 ``session/update`` (including the ``_meta.kiro`` display kinds
 :mod:`kiro_crew.acp.kas_wire` matches on), ``session/request_permission``
 round-trips, and the connection-level notifications. The relay additionally
-advertises two extension methods the direct route did not, so its surface is a
-superset. The one frame that stops arriving is ``_kiro/auth/getAccessToken``,
+advertises two extension methods the direct route does not, so its surface is a
+superset. The one frame the relay never carries is ``_kiro/auth/getAccessToken``,
 which is the point.
 
-Sandbox posture is unchanged by the switch, and this is the reason Crew's own
+Neither route brings a sandbox of its own, and this is the reason Crew's own
 seatbelt must stay on (see ``ACP_BACKENDS_INTERNAL_SANDBOX`` in
 :mod:`kiro_crew.acp.types`). KAS implements its own OS sandbox -- seatbelt on
 macOS, bubblewrap on Linux -- selected by an ``--sandbox`` argument on its ACP
@@ -37,7 +37,7 @@ relay does NOT pass that argument (``spawn_kas_process`` builds exactly
 ``node --experimental-wasm-modules <acp-server.js> --transport=stdio
 --auth=acp-callback``), and KAS's sandbox factory returns its no-op backend for
 an absent config. So KAS runs with no OS sandbox of its own either way: the argv
-kiro-cli builds is byte-for-byte the argv Crew used to build itself. Two
+kiro-cli builds is byte-for-byte the argv Crew would build itself. Two
 consequences: there is no inner sandbox that could fail to nest inside Crew's
 seatbelt, and there is nothing for Crew to delegate isolation TO -- claiming the
 delegation would leave KAS unconfined on macOS.

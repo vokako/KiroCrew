@@ -354,12 +354,11 @@ async def _persist_turn_row(
 ) -> None:
     """Persist one per-turn usage row for a background dispatch surface.
 
-    Extracted so the heartbeat and monitor surfaces — each with a success and a
-    timeout twin that were byte-identical copies — share one implementation
-    instead of cloning the block a fourth (and fifth, sixth…) time (issue
-    #1086, following the usage-row wiring from issue #647). Best-effort: a
-    persistence failure is logged at debug and never propagates into the
-    background loop, since a dropped analytics row must not abort a live turn.
+    The heartbeat and monitor surfaces — each with a success and a timeout twin
+    that would otherwise be byte-identical copies — share one implementation instead of
+    cloning the block a fourth (and fifth, sixth…) time. Best-effort: a persistence
+    failure is logged at debug and never propagates into the background loop, since a
+    dropped analytics row must not abort a live turn.
 
     ``agent_fallback`` is a zero-arg callable, invoked INSIDE the try/except and
     only when ``read_effective_agent`` yields nothing — preserving the original
@@ -868,20 +867,20 @@ async def _await_cron_fire_time_gate(
 ) -> tuple[str | None, bool]:
     """Await the fire-time governance gate, bounded, returning ``(reason, starved)``.
 
-    The gate used to be awaited as a bare ``run_in_executor`` on the shared
+    The gate is NOT awaited as a bare ``run_in_executor`` on the shared
     governance pool, with no timeout of its own, INSIDE the wake deadline
-    ``_execute_with_timeout`` has already armed.  Two things followed, and a
-    review lane raised both:
+    ``_execute_with_timeout`` has already armed.  Two things follow from that
+    shape:
 
-    * that pool is paced by REMOTE senders, so an inbound burst put an unbounded
+    * that pool is paced by REMOTE senders, so an inbound burst puts an unbounded
       FIFO backlog ahead of a cron gate; and
     * a message job carries no ``_pool_queue_allowance``, so the whole backlog
-      was charged to its execution budget.  When the wake deadline expired
-      first, ``_execute_with_timeout`` caught the ``TimeoutError`` and returned
-      normally, so ``_merge_job_result`` saw an ordinary finished run -- and a
-      ``delete_after_run`` job was consumed by a run that never dispatched.
+      is charged to its execution budget.  When the wake deadline expires
+      first, ``_execute_with_timeout`` catches the ``TimeoutError`` and returns
+      normally, so ``_merge_job_result`` sees an ordinary finished run -- and a
+      ``delete_after_run`` job is consumed by a run that never dispatched.
 
-    The gate now runs on its own pool and its TOTAL wait -- queue plus execution,
+    So the gate runs on its own pool and its TOTAL wait -- queue plus execution,
     which is why the budget is split across those phases rather than given to
     each -- is bounded below the wake budget, so starvation surfaces as
     ``CronQueueTimeout`` BEFORE the deadline can fire.  That is what makes the
@@ -896,18 +895,18 @@ async def _await_cron_fire_time_gate(
     auto-pause a job that never ran a line.
     """
     budget = cron_gate_budget(effective_wake_budget(job))
-    # Default to RETAIN for exactly the duration of the await.  The marker used to
-    # be set only INSIDE the handler below -- that is, only when the await raised
-    # something that handler catches.  A recoverable event-loop stall can carry
+    # Default to RETAIN for exactly the duration of the await.  Setting the marker
+    # only INSIDE the handler below -- that is, only when the await raises something
+    # that handler catches -- is not enough.  A recoverable event-loop stall can carry
     # wall clock past the gate's own bounds AND the wake deadline, and the
-    # ``asyncio.wait_for`` in ``_execute_with_timeout`` then cancels this coroutine
-    # AT the await: no handler runs, the marker stays False, that timeout is caught
-    # and returns normally, and ``_merge_job_result`` consumes a
+    # ``asyncio.wait_for`` in ``_execute_with_timeout`` then cancels this coroutine AT
+    # the await: no handler runs, the marker stays False, that timeout is caught and
+    # returns normally, and ``_merge_job_result`` consumes a
     # ``delete_after_run`` job that never dispatched.  Sizing the internal bounds
     # correctly cannot prevent it, because nothing inside the call is scheduled to
     # notice.  ``CancelledError`` is a ``BaseException`` on both interpreters in
     # this matrix, so it escapes the ``except Exception`` below and the marker
-    # survives -- which is the fix.
+    # survives -- which is why the default is set here.
     job.run_never_started = True
     try:
         reason = await run_in_cron_gate_pool(vet_job_at_fire_time, job, timeout=budget)
@@ -916,11 +915,11 @@ async def _await_cron_fire_time_gate(
         # (cron.py:2852). For an agent/message job ``last_result`` is the
         # cross-run dedup context build_cron_session_context prepends as "do
         # NOT repeat", and a run starved here produced no result to replace it
-        # -- clearing it made the NEXT run repeat content it had already sent.
+        # -- clearing it makes the NEXT run repeat content it had already sent.
         # Command and script jobs still clear: the prompt built for them is
         # discarded, so a carried value could only show a previous run's output
         # beside this run's status. The message fire-time deny path below never
-        # clears either, so all three sites now agree.
+        # clears either, so all three sites agree.
         if job.command or job.script:
             job.clear_carried_result()
         job.last_status = "error"
@@ -959,7 +958,7 @@ async def _await_cron_fire_time_gate(
 
 
 async def _pre_create_cron_slot(dashboard_state: "DashboardState", job: CronJob) -> None:
-    """Pre-create the job's first-run dashboard tab (#8336), best-effort.
+    """Pre-create the job's first-run dashboard tab, best-effort.
 
     :func:`ensure_cron_slot` gives a first run its tab — and with it its
     session-control caller identity and dashboard-surface routing — before
@@ -1116,11 +1115,10 @@ def claim_vet_bound(job: CronJob) -> float:
 def _claim_backstop(job: CronJob, subprocess_bound: int) -> float:
     """The inner ``run_in_cron_pool`` bound: subprocess + teardown + vet.
 
-    One budget covers all three serially, so each needs a term.  ``+ 5`` used to
-    be written here as a literal duplicate of
-    :data:`~kiro_crew.cron._SUBPROC_CLEANUP_ALLOWANCE_SECS`; reading the constant
-    keeps the teardown margin single-sourced, and adding
-    :func:`claim_vet_bound` stops the vet spending the teardown's share of it.
+    One budget covers all three serially, so each needs a term.  ``+ 5`` is read
+    from :data:`~kiro_crew.cron._SUBPROC_CLEANUP_ALLOWANCE_SECS` rather than
+    written here as a literal, which keeps the teardown margin single-sourced,
+    and :func:`claim_vet_bound` stops the vet spending the teardown's share of it.
     """
     return subprocess_bound + _SUBPROC_CLEANUP_ALLOWANCE_SECS + claim_vet_bound(job)
 
@@ -1198,10 +1196,9 @@ def _vet_at_claim_then(
     return fn(*args)
 
 
-# One spelling of the fallback-served warning for every unattended surface
-# (issue #5447 item 4): the body lives next to TURN_FALLBACK_ATTR in
-# llm_helpers; this module-level name is kept for the cron/heartbeat call
-# sites and their tests.
+# One spelling of the fallback-served warning for every unattended surface: the body
+# lives next to TURN_FALLBACK_ATTR in llm_helpers; this module-level name is kept for
+# the cron/heartbeat call sites and their tests.
 _annotate_model_fallback = annotate_model_fallback
 
 
@@ -1250,9 +1247,9 @@ async def _cron_stream_with_posttoken_resume(
       turn — the CONTINUE instruction forbids re-running *completed* tools
       only. On an ``approval_mode == "auto"`` job that re-issue meets no gate
       and no human, an unattended posture narrower than the live-viewer
-      surface the tradeoff was originally accepted for. Accepted: the window
+      surface the tradeoff is accepted for. Accepted: the window
       is rare (mid-flight tool AND a transient), and failing the whole cycle
-      fast was exactly the behaviour this fix exists to remove.
+      fast is the behaviour the resume exists to remove.
     - The resume adds at most one bounded prompt plus one backoff sleep to the
       cycle's worst case, inside the same per-wake ``asyncio.wait_for``
       deadline. A deadline firing mid-continuation degrades exactly as a
@@ -1363,9 +1360,8 @@ def _channel_transport_permitted(member: str) -> bool:
     * ``session_key=HOST_SESSION_KEY`` — starting a transport is an operator/host
       action, so it is governed by the policy ceiling AND any ``bind: {type:
       surface, id: host}`` profile.  An empty key would classify to surface
-      ``unknown`` and silently ignore a host profile (and historically
-      mis-classified to ``slack``); the same fix ``apps/manager`` and
-      ``slack/enterprise.py`` apply.
+      ``unknown`` and silently ignore a host profile; the same fix
+      ``apps/manager`` and ``slack/enterprise.py`` apply.
     * Both the DENY and the ALLOW decision are audited here via
       ``sel().log_governance_decision`` — ``governance_permits`` audits only its
       own degrade, not a normal permit/deny, so the caller owns both.
@@ -1814,7 +1810,7 @@ class GatewayOrchestrator:
         # by messaging.registry.start_channels until the config-schema PR
         # retires them; shutdown closes through THIS dict.
         self._channel_handles: dict[str, object] = {}
-        # Detached boot task that replays the durable inbound spool (issue #2217).
+        # Detached boot task that replays the durable inbound spool.
         # Held on the instance so the task is not garbage-collected mid-flight.
         self._inbound_replay_task: "asyncio.Task[None] | None" = None
         self._model_download_task: "asyncio.Task[bool] | None" = None
@@ -1833,7 +1829,7 @@ class GatewayOrchestrator:
         # daemon is actually serving rather than a freshly re-derived guess.
         self._mcp_target_env: dict[str, str] = {}
         # Resolved here, in sync construction, because config_dir() does file IO
-        # and must never be called from an async path (issue #1057). The store
+        # and must never be called from an async path. The store
         # lives beside the rest of the data home for the life of the process.
 
         self._mcp_resolve_home: str = str(config_dir())
@@ -2793,8 +2789,7 @@ class GatewayOrchestrator:
             raise
         except Exception:
             # Transport/pipe errors must not abort boot (this helper's
-            # contract is "never raises" — the pre-#3051 code swallowed them
-            # via a blanket except). Kill+reap best-effort and continue.
+            # contract is "never raises"). Kill+reap best-effort and continue.
             await self._kill_startup_child(proc)
             await self._reap_startup_child(proc)
             logger.debug("kiro-cli --version probe failed", exc_info=True)
@@ -2814,13 +2809,12 @@ class GatewayOrchestrator:
     async def _init_services(self) -> None:
         """Initialize memory, skills, hooks, context, history, sessions.
 
-        Async so the blocking pieces named by issue #3051 — the kiro-cli
-        version probe, the pip dep repair, ``VectorMemoryStore.init()`` and
-        ``memory.rebuild_index()`` — run off the event loop. Object
-        CONSTRUCTION deliberately stays on the loop thread:
-        ``SessionManager.__init__`` creates asyncio primitives (locks,
-        semaphores, queues), so hopping the whole method into a worker thread
-        would trade a blocking bug for a thread-affinity one. (Other sync
+        Async so the blocking pieces — the kiro-cli version probe, the pip dep repair,
+        ``VectorMemoryStore.init()`` and ``memory.rebuild_index()`` — run off the event
+        loop. Object CONSTRUCTION deliberately stays on the loop thread:
+        ``SessionManager.__init__`` creates asyncio primitives (locks, semaphores,
+        queues), so hopping the whole method into a worker thread would trade a blocking
+        bug for a thread-affinity one. (Other sync
         filesystem steps — e.g. agent-config install — remain on the loop;
         they are bounded small-file work, not usage-scaled. The builtin-skills
         sync verifies user-owned trees before replacing them, so it runs as a
@@ -2852,14 +2846,14 @@ class GatewayOrchestrator:
             # rather than importing ``agent.run_first_run_setup`` directly, so
             # first-run setup is genuinely extensible: an edition composes an
             # adapter that adds its own one-time provisioning on top. The
-            # ``DefaultAgentRuntime`` delegates to exactly the same
-            # ``agent.run_first_run_setup()`` this line used to call, so the
-            # standalone build is behaviorally identical (asserted in
+            # ``DefaultAgentRuntime`` delegates to
+            # ``agent.run_first_run_setup()``, so the standalone build behaves
+            # exactly as calling it directly does (asserted in
             # test_cpp_wiring_standalone).
             #
             # ``safe_context_call`` keeps a transient adapter error from breaking
             # startup (``fallback=None`` matches the seam's ``-> None`` contract),
-            # matching the pre-existing best-effort posture of this block.
+            # matching the best-effort posture of this block.
             # The fail-closed guarantee for a non-standalone host is already
             # discharged EARLIER, by ``boot_platform`` in ``run_gateway``: it
             # aborts before the orchestrator is built, so a companion that cannot
@@ -3004,7 +2998,7 @@ class GatewayOrchestrator:
 
         # Channel history buffer. data_home(), not config_dir(): this method is
         # async and config_dir() re-runs start-of-process maintenance (mkdir,
-        # breadcrumb refresh, archive sweep) on every call — #1057.
+        # breadcrumb refresh, archive sweep) on every call.
         self.channel_history = ChannelHistory(
             observe_max_entries=self._cfg.observe_max_messages,
             observe_ttl_secs=int(self._cfg.observe_ttl_hours * 3600),
@@ -3322,7 +3316,7 @@ class GatewayOrchestrator:
             # ``display_safe``: it is context-aware, and the shared sink's default
             # pair would silently drop that.
             #
-            # Trailing control-tag lines are stripped FIRST (#7948): this is the
+            # Trailing control-tag lines are stripped FIRST: this is the
             # proactive egress chokepoint for cron results and subagent
             # completions authored under dashboard rules, and Slack renders
             # HTML comments literally. Strip-then-redact matches display_safe.
@@ -3471,10 +3465,9 @@ class GatewayOrchestrator:
     # mechanism below -- the dedup window, the Slack-sink hardening, the
     # one-surface delivery rule, and when the dedup anchor advances.
     #
-    # That used to rest on a docstring promising the two "cannot drift", which
-    # is prose, not a mechanism: the message path's DM was once left saying only
-    # "check logs" while the helper already carried the reason, and review caught
-    # it rather than a test. These four helpers are the mechanism, so a change
+    # A docstring promising the two "cannot drift" is prose, not a mechanism, and
+    # prose lets one path's DM say only "check logs" while the helper already
+    # carries the reason. These four helpers are the mechanism, so a change
     # lands on both surfaces or on neither.
 
     def _failure_alert_is_duplicate(self, job: CronJob, failure_hash: str) -> bool:
@@ -4250,11 +4243,10 @@ class GatewayOrchestrator:
                     # Fire-time governance gate — mirrors the command path above.
                     # vet_job_at_fire_time re-runs the capabilities.cron gate AND
                     # re-scans the script BODY on the freshly re-resolved path
-                    # (which also validates the path, as the bare
-                    # resolve_script_path call here previously did), so a policy
-                    # tightened after scheduling — or a script file edited on disk
-                    # after authoring — denies this run. The job is kept: a later
-                    # policy loosening lets it resume on its own.
+                    # (which also validates the path, as a bare resolve_script_path call
+                    # would), so a policy tightened after scheduling — or a script file
+                    # edited on disk after authoring — denies this run. The job is kept:
+                    # a later policy loosening lets it resume on its own.
                     # Off-loop: reads the script body from disk (up to the scan
                     # cap) — must not block the event loop on a wedged FS.
                     # Governance pool, not the cron pool: see the command site.
@@ -4299,7 +4291,7 @@ class GatewayOrchestrator:
                     # the body from disk in the child, so the gate's scan alone
                     # authorises bytes that may no longer be there.  The re-vet
                     # runs inside the worker, after the wait, so the decision
-                    # holds at the moment of use.  It also now shares the
+                    # holds at the moment of use.  It also shares the
                     # backstop below, which is why it must stay short.
                     result = await run_in_cron_pool(
                         _vet_at_claim_then,
@@ -4441,8 +4433,7 @@ class GatewayOrchestrator:
                     # Starvation means the script never ran a line, so counting it
                     # would auto-pause a healthy job after _AUTO_PAUSE_THRESHOLD
                     # starved wakes and leave it disabled once the pool recovered.
-                    # The auto-pause log that used to sit here went with it: this
-                    # path can no longer reach the threshold.
+                    # No auto-pause log here: this path cannot reach the threshold.
                     try:
                         sel().log_tool_invocation(
                             session_key=f"cron:{job.id}",
@@ -4603,9 +4594,9 @@ class GatewayOrchestrator:
 
             # ── Fire-time governance gate: message (LLM) jobs ──
             # Command and script jobs are gated inside their blocks above; a job
-            # reaching this point dispatches an LLM turn. Message jobs previously
-            # had NO fire-time capabilities.cron check at all, so disabling the
-            # cron capability after scheduling never affected them. Same deny
+            # reaching this point dispatches an LLM turn. Without this gate a
+            # message job gets NO fire-time capabilities.cron check at all, so disabling
+            # the cron capability after scheduling would not affect it. Same deny
             # semantics as the other kinds: mark the run failed, keep the job.
             # Off-loop for the same reason as the command/script sites above, and
             # on the GOVERNANCE pool for the same reason: a message job gets no
@@ -4636,27 +4627,26 @@ class GatewayOrchestrator:
                 await _alert_cron_failure(job, gate_reason, denied=True)
                 return None
 
-            # ── First-run tab pre-create (#8336) ──
-            # The result injection at the end of this callback used to be the
-            # ONLY creator site for the job's dashboard tab, so during a NEW
-            # job's first run the tab did not exist: session-control caller
-            # identity (caller_slot_key walks slot links for cron:{id}) refused
+            # ── First-run tab pre-create ──
+            # Without this, the result injection at the end of this callback is
+            # the ONLY creator site for the job's dashboard tab, so during a NEW
+            # job's first run the tab does not exist: session-control caller
+            # identity (caller_slot_key walks slot links for cron:{id}) refuses
             # every verb with caller_unidentified, and the dashboard-surface
-            # registry had no row for sub-agent/widget/question/approval
+            # registry has no row for sub-agent/widget/question/approval
             # routing. Bind the tab up front — eligibility (persistent_session
             # and not hide_in_chat) lives inside the helper, so script/command
             # jobs never reach it (they return above) and ineligible message
             # jobs are untouched. Placed AFTER the fire-time gate: a denied run
-            # dispatches nothing a tab could serve. Visible consequence, which
-            # #8336 flags as needing an explicit decision: a first run that
-            # starts and then fails now leaves an empty tab where previously
-            # none appeared. Decided HERE in favor of pre-creating anyway,
-            # because gating the tab on the run reaching injection would recreate
-            # the very hole this fixes — identity must exist DURING the run.
+            # dispatches nothing a tab could serve. Visible consequence, decided
+            # HERE in favor of pre-creating anyway: a first run that starts and
+            # then fails leaves an empty tab rather than no tab at all, because
+            # gating the tab on the run reaching injection would recreate the
+            # very hole this closes — identity must exist DURING the run.
             # Guarded wrapper, not a bare await: a tab we FAIL to mint must not
             # kill — or, via the run_never_started lifecycle, CONSUME — the
             # one-shot run it was meant to serve (see _pre_create_cron_slot
-            # for the retention-marker contract a review lane convicted here).
+            # for the retention-marker contract).
             if self.dashboard_state:
                 await _pre_create_cron_slot(self.dashboard_state, job)
 
@@ -4994,12 +4984,11 @@ class GatewayOrchestrator:
                 # Suppress repeated identical results to avoid spam. This is
                 # delivery-agnostic in both directions: the anchor it reads is
                 # advanced by _record_cron_delivery on EVERY confirmed surface,
-                # so the early return below now suppresses the channel post too,
-                # not only Slack's. That is a real behaviour change for a
-                # channel-delivered cron -- it used to post unconditionally on
-                # every tick -- and it is the intended one: identical output is
-                # equally noisy in a Telegram chat, and the 24h reminder plus the
-                # "same result N times in a row" caption are what keep a
+                # so the early return below suppresses the channel post too,
+                # not only Slack's. A channel-delivered cron therefore does NOT
+                # post unconditionally on every tick, and that is intended: identical
+                # output is equally noisy in a Telegram chat, and the 24h reminder plus
+                # the "same result N times in a row" caption are what keep a
                 # persistently-identical job from going unnoticed.
                 rh = _result_hash(result_text)
 
@@ -5273,14 +5262,13 @@ class GatewayOrchestrator:
                 # backoff instead of counting a failure. stream_and_collect's
                 # in-stream retry only covers errors raised INSIDE the prompt
                 # stream; a throttle/5xx during session acquire, client
-                # creation, or context assembly propagates here and — before
-                # this branch existed — went straight to record_failure(),
+                # creation, or context assembly propagates here, and without
+                # this branch it would go straight to record_failure(),
                 # marching consecutive_failures toward auto-pause (threshold
-                # 5) on pure infrastructure weather. The subagent path has
-                # retried these 3x with backoff since it existed; this brings
-                # the cron path to the same semantics (Phase 0, Finding 1:
-                # five throttled wakes would silently auto-pause a healthy
-                # perpetual agent).
+                # 5) on pure infrastructure weather -- five throttled wakes
+                # would silently auto-pause a healthy perpetual agent. The
+                # subagent path retries these 3x with backoff; the cron path
+                # carries the same semantics.
                 #
                 # Guarded by the same recursion marker pattern as the ACP
                 # retry: the attempt counter lives on the job for the duration
@@ -5585,7 +5573,7 @@ class GatewayOrchestrator:
                         # reset done → reaper no longer needs this key.
                         if self.cron_svc is not None:
                             self.cron_svc.clear_active_session_key(job.id)
-                # Restore per-job env vars (single-agent path) — now handled via extra_env passthrough
+                # Per-job env vars (single-agent path) travel via extra_env passthrough
 
         self.cron_svc = await CronService.create(base_dir=data_home(), on_job=_cron_callback)
         if self.dashboard_state:
@@ -5711,9 +5699,9 @@ class GatewayOrchestrator:
                     HEARTBEAT_TASK_TIMEOUT_SECS,
                     task_text[:80],
                 )
-                # ── Timeout spend is REAL spend (issue #874 follow-up). ──
-                # Before this, a timed-out heartbeat wrote no row at all, so
-                # every cancelled turn silently dropped whatever it had already
+                # ── Timeout spend is REAL spend. ──
+                # Without a row here, a timed-out heartbeat records nothing and
+                # the cancelled turn silently drops whatever it had already
                 # cost. Record it here, BEFORE the session reset below tears the
                 # client down and takes its last-turn usage with it.
                 #
@@ -5759,12 +5747,11 @@ class GatewayOrchestrator:
                 # Gate-side LOG line, so it takes the context spelling: a host with
                 # a companion loaded must not have this text scanned with the
                 # weaker OSS pass. Truncation comes AFTER redaction — the
-                # invariant #7424 established, and the one
-                # ``redact_log_via_context`` hands to its callers by contract:
-                # slicing first would leave a credential as an unmatchable
-                # fragment. The sibling below stays on ``redact_and_truncate``
-                # because it feeds a DELIVERY, not a log, and the two want
-                # different failure modes on a non-composable host.
+                # invariant ``redact_log_via_context`` hands to its callers by contract:
+                # slicing first would leave a credential as an unmatchable fragment. The
+                # sibling below stays on ``redact_and_truncate`` because it feeds a
+                # DELIVERY, not a log, and the two want different failure modes on a
+                # non-composable host.
                 logger.info(
                     "Heartbeat task incomplete, suppressing delivery: %s",
                     redact_log_via_context(task_text)[:80],
@@ -6000,11 +5987,11 @@ class GatewayOrchestrator:
                 )
             raise
         except asyncio.TimeoutError:
-            # ── Timeout spend is REAL spend (issue #874 follow-up). ──
-            # A timed-out nudge turn previously fell through to the generic
-            # handler below and wrote no row at all, silently dropping whatever
-            # the cancelled turn had already cost. Record it, then bail as
-            # before. Runs before the `finally` cancels/releases the session.
+            # ── Timeout spend is REAL spend. ──
+            # Without this, a timed-out nudge turn falls through to the generic
+            # handler below and writes no row at all, silently dropping whatever
+            # the cancelled turn had already cost. Record it, then bail. Runs
+            # before the `finally` cancels/releases the session.
             #
             # No new schema field: the record has never carried a
             # success/failure outcome for ANY surface, so a timeout row is no
@@ -6905,7 +6892,7 @@ class GatewayOrchestrator:
         event reaches it. Writing the ``delivered`` tombstone when the announce is
         merely QUEUED starts that clock while the event is still waiting for a
         turn, so a long-running turn ahead of it lets the reaper prune every file
-        the queued announce points at (issue #4839).
+        the queued announce points at.
 
         So the ids are handed to the slot keyed on the announce ITSELF,
         ``_delivery_queued`` tells the run loop to skip its own ``mark_delivered``,
@@ -7562,8 +7549,8 @@ class GatewayOrchestrator:
                 f"{guard_msg}"
             )
             # Structured header facts for the dashboard card, stamped on the row
-            # so a reword of the prose above cannot silently break rendering
-            # (#1792). The card reads this; the frontend regexes are a fallback.
+            # so a reword of the prose above cannot silently break rendering.
+            # The card reads this; the frontend regexes are a fallback.
             # Reassigned for the wave-digest shapes below when this member's
             # completion is folded into a batch chunk instead of injected alone.
             sub_meta = single_completion_meta(
@@ -7658,11 +7645,10 @@ class GatewayOrchestrator:
                     bp["err"] += 1
                 else:
                     bp["ok"] += 1
-                # Per-member model provenance in the PARENT-READ digest text
-                # (issue #5337): the announce body the parent LLM consumes is
-                # built from ok_lines/fail_lines, so surface each member's served
-                # model inline there — rather than in a structured meta field
-                # with no consumer.
+                # Per-member model provenance in the PARENT-READ digest text:
+                # the announce body the parent LLM consumes is built from
+                # ok_lines/fail_lines, so surface each member's served model inline
+                # there — rather than in a structured meta field with no consumer.
                 #
                 # Print the SERVED model id only (no "(requested …)" qualifier):
                 # `_res_model != _req_model` is NOT how the card decides a
@@ -7670,13 +7656,13 @@ class GatewayOrchestrator:
                 # and treats alias-vs-canonical / routing-prefix pairs as the
                 # same model, so a raw inequality would print a false downgrade
                 # on every member of a normal wave (default agent.model is
-                # "auto"). Until this uses the same fold (or #5339's registry
-                # fold), show only the served id, and show nothing when there is
-                # no served model — matching what the card renders in that case.
+                # "auto"). Until this uses the same fold, show only the served
+                # id, and show nothing when there is no served model — matching
+                # what the card renders in that case.
                 # The value is caller-influenceable (spawn_run.model), so redact
                 # it through the display context before it enters the digest
-                # text broadcast to the dashboard/channels (GPT 5.6:
-                # credential-shaped input must not reach metadata).
+                # text broadcast to the dashboard/channels: credential-shaped
+                # input must not reach metadata.
                 _res_model = info.resolved_model or ""
                 if _res_model:
                     _res_model, _ = redact_for_display(_res_model, redact_via_context)
@@ -7744,16 +7730,15 @@ class GatewayOrchestrator:
                     # completions flush ONE digest chunk (an injection turn);
                     # the final member flushes the remaining partial chunk.
                     # This bounds each digest's size AND gives the parent
-                    # incremental signal — one straggler no longer withholds
-                    # every sibling's result for its entire runtime (Design
-                    # Review CONCERN 1).
+                    # incremental signal — one straggler does not withhold
+                    # every sibling's result for its entire runtime.
                     #
                     # The count trigger alone cannot deliver that incremental
-                    # signal for a wave smaller than the chunk size (issue
-                    # #2215): _pending can never reach it, so wave close is the
-                    # only flush. _flush_only is the LATENCY trigger the count
-                    # lacks — the reaper's hold-deadline sweep forces the
-                    # pending chunk out once results have been held too long.
+                    # signal for a wave smaller than the chunk size: _pending can
+                    # never reach it, so wave close is the only flush. _flush_only is
+                    # the LATENCY trigger the count lacks — the reaper's hold-deadline
+                    # sweep forces the pending chunk out once results have been held too
+                    # long.
                     _pending = bp["done"] - bp["flushed"]
                     _flush = _last or _flush_only or _pending >= SUBAGENT_DIGEST_CHUNK_SIZE
                     if not _flush:
@@ -7787,7 +7772,7 @@ class GatewayOrchestrator:
                     # Chunk fires now. Do NOT settle the held members'
                     # delivery tombstones here — composition precedes routing,
                     # and marking "delivered" before the chunk is handed off
-                    # would re-open the restart-loss window (GPT 5.6 HIGH).
+                    # would re-open the restart-loss window.
                     # Stash the ids on the flushing member: the run loop
                     # settles them only after _on_done (which includes the
                     # routing below) returns without raising.
@@ -7861,7 +7846,7 @@ class GatewayOrchestrator:
                         # full chunk: say so, or the parent reads "still
                         # running" as normal progress and keeps waiting rather
                         # than deciding whether the remainder is worth waiting
-                        # for (issue #2215).
+                        # for.
                         _why = (
                             f"The results below were finished and held for "
                             f"{int(DIGEST_HOLD_SECS)}s+ while the remaining "
@@ -7930,7 +7915,7 @@ class GatewayOrchestrator:
                     # Do NOT swallow-and-return: fall through to the default
                     # injection path so the result still reaches the user
                     # (a crew-store write failure must not silently discard
-                    # the completion — GPT review finding on 76d35e37).
+                    # the completion).
                     logger.warning(
                         "crew: completion delivery failed for %s — falling back to default injection",
                         info.id,
@@ -8052,7 +8037,7 @@ class GatewayOrchestrator:
                                 # on any exit path.
                                 # Carry the structured completion facts so the
                                 # drained row is a card without re-parsing the
-                                # prose (#1792); _start_next_queued_turn reads them.
+                                # prose; _start_next_queued_turn reads them.
                                 _injection_slot.queue_append(
                                     announce,
                                     kind=SUBAGENT_COMPLETION_KIND,
@@ -8066,7 +8051,7 @@ class GatewayOrchestrator:
                                 # the delivery tombstones to that drain instead of
                                 # writing them now, or the reaper prunes
                                 # result.txt while the promise is still queued
-                                # and the parent is handed dead paths (#4839).
+                                # and the parent is handed dead paths.
                                 self._defer_queued_delivery(
                                     _injection_slot, announce, info, flush_only=_flush_only
                                 )
@@ -8094,7 +8079,7 @@ class GatewayOrchestrator:
                         # turn is a task, and `_on_done` returns to
                         # `_report_terminal` while it is still pending — so a
                         # bare return here is a local routing success, not
-                        # evidence the parent received anything (#2233). Owe
+                        # evidence the parent received anything. Owe
                         # the delivery bookkeeping to the turn's CONSUMPTION
                         # instead, through the same `_defer_queued_delivery`
                         # the queue branch uses: it records the debt (the
@@ -8174,10 +8159,9 @@ class GatewayOrchestrator:
                         if _owes_delivery:
                             # Settle the owed tombstones only once the model has
                             # consumed this turn's prompt — the drain's own
-                            # settlement path, reused verbatim (#2233, riding
-                            # the #4839 ledger). If the transfer above fell
-                            # back (stubbed slot), the ledger holds no debt and
-                            # the claim inside is an empty no-op.
+                            # settlement path, reused verbatim. If the transfer above
+                            # fell back (stubbed slot), the ledger holds no debt and the
+                            # claim inside is an empty no-op.
                             _arm_queued_delivery_settlement(
                                 self.dashboard_state,
                                 _injection_slot,
@@ -8734,8 +8718,8 @@ class GatewayOrchestrator:
             falls through to the owner-DM path. ``msg`` is redacted by the
             manager before delivery; re-redact defensively anyway.
 
-            ``meta`` carries the structured completion facts (#1792) so the
-            orphan row renders as a card without re-parsing its prose header.
+            ``meta`` carries the structured completion facts so the orphan row renders
+            as a card without re-parsing its prose header.
             """
             # Deliver to whichever tab shows the parent conversation, including a
             # channel-born one; only a parent with no tab wants the owner DM.
@@ -8804,9 +8788,9 @@ class GatewayOrchestrator:
         """Attach the Crew Mode control plane (engineered pipeline;
         decision-only agent) to dashboard_state so api_chat can route
         crew-slot messages to it. MUST run after _init_dashboard() —
-        dashboard_state is None until then (GPT review finding on
-        faf5a127: attaching from _init_subagents silently skipped crew
-        setup in every real gateway boot)."""
+        dashboard_state is None until then, so attaching from
+        _init_subagents silently skips crew setup in every real gateway
+        boot."""
         if self.dashboard_state is None:
             return
         try:
@@ -9129,11 +9113,11 @@ class GatewayOrchestrator:
                 # Probe for work BEFORE touching the embedder. wait_ready() below
                 # calls _kick_background_load(), which mmaps the ~700MB GGUF and
                 # allocates its KV/compute buffers — the single largest chunk of
-                # gateway RSS. A boot with nothing to embed used to pay all of it
-                # for a sweep that then embedded zero rows. Both probes here are
-                # non-loading: has_pending_embeddings() is three LIMIT-1 SELECTs,
-                # and store_embedding_space_is_stale() compares signatures built
-                # from model_id/dim, which are set when the backend is CONSTRUCTED.
+                # gateway RSS. A boot with nothing to embed would otherwise pay
+                # all of it for a sweep that embeds zero rows. Both probes here
+                # are non-loading: has_pending_embeddings() is three LIMIT-1 SELECTs,
+                # and store_embedding_space_is_stale() compares signatures built from
+                # model_id/dim, which are set when the backend is CONSTRUCTED.
                 # Deliberately NOT reconcile_store_embedding_space(): that one is
                 # destructive and refuses to clear against an unready backend, so
                 # it is the wrong tool for a question asked before the load.
@@ -9172,11 +9156,10 @@ class GatewayOrchestrator:
             # from a ~72-minute worst case into a multi-hour one, and mc-maint is
             # a 4-worker pool documented as "reserved for the FAST periodic
             # sweeps + overlay rewrites" — parking one of its four slots
-            # (mostly asleep) for a working day is a regression the pacing
-            # introduced. mc-embed is the bulkhead built for exactly this: its
-            # rationale is that embed work "queues behind ITSELF instead of
-            # starving" everything else, it has 8 workers, and the same
-            # atexit shutdown hook already covers it. Interactive embeds are
+            # (mostly asleep) for a working day is a regression. mc-embed is the
+            # bulkhead built for exactly this: its rationale is that embed work "queues
+            # behind ITSELF instead of starving" everything else, it has 8 workers, and
+            # the same atexit shutdown hook already covers it. Interactive embeds are
             # unaffected either way — LlamaCppEmbedder serializes every call
             # onto one owned inference thread, so the model lock is the
             # bottleneck there, not a pool slot.
@@ -9467,7 +9450,7 @@ class GatewayOrchestrator:
         Restarting to shorten that wait still destroys work: the drain gives
         in-flight tool calls ``DRAIN_SECS`` to finish and then cancels them.
         The stub re-attaches to the replacement daemon afterwards, so those
-        servers are no longer lost for the session's life -- but a cancelled call
+        servers are not lost for the session's life -- but a cancelled call
         is still a cancelled call, and the restart buys the running session
         nothing, because its toolset was fixed at ``session/new``.
 
@@ -10044,8 +10027,7 @@ class GatewayOrchestrator:
         # Timeout/cancel discipline for every spawn below. Function-local like
         # the wheel path's import further down this file: the helper owns the
         # kill-the-tree + bounded-reap contract, and there is exactly one
-        # implementation of it (issue #4210 exists to close the two-conventions
-        # gap, not to add a second helper).
+        # implementation of it.
         from kiro_crew.platform.update_provider import _kill_and_reap
 
         # Loaded before the reinstall below for the same reason as the provider
@@ -10106,11 +10088,11 @@ class GatewayOrchestrator:
                 stderr=asyncio.subprocess.DEVNULL,
                 # Own process group (POSIX; no-op on Windows) so a timeout or
                 # cancellation kill reaches the whole tree, not just the direct
-                # child. Every spawn in this method carries the same discipline
-                # (issue #4210): on TimeoutError/CancelledError, kill the tree
-                # and reap under a bound via the shared `_kill_and_reap`, then
-                # re-raise so the outer handler keeps its current behaviour —
-                # without this the child is ABANDONED on timeout, not stopped.
+                # child. Every spawn in this method carries the same discipline: on
+                # TimeoutError/CancelledError, kill the tree and reap under a bound via
+                # the shared `_kill_and_reap`, then re-raise so the outer handler keeps
+                # its current behaviour — without this the child is ABANDONED on
+                # timeout, not stopped.
                 start_new_session=platform_compat.IS_POSIX,
             )
             try:
@@ -10327,10 +10309,10 @@ class GatewayOrchestrator:
                 return
 
             # 3. Uncommitted tracked edits. REFUSE, like the two checks above —
-            #    this one used to log a warning and then reset anyway, which made
-            #    an unattended boot-time update the one code path that could
-            #    silently destroy a developer's uncommitted work. `reset --hard`
-            #    is not recoverable and nothing here has the standing to make
+            #    logging a warning and resetting anyway would make an unattended
+            #    boot-time update the one code path that could silently destroy
+            # a developer's uncommitted work. `reset --hard` is not recoverable and
+            # nothing here has the standing to make
             #    that trade on the developer's behalf: the count check one screen
             #    up already refuses for COMMITTED work and defers to `kirocrew
             #    update`, and uncommitted work is the strictly more fragile case
@@ -11143,7 +11125,7 @@ class GatewayOrchestrator:
         # inline would delay readiness in proportion to that. It goes to a worker
         # thread on a tracked task instead, and the process-start cutoff means it
         # cannot mistake a session THIS process opens in the meantime for a
-        # casualty of the last one -- so it no longer has to finish before the
+        # casualty of the last one -- so it does not have to finish before the
         # gateway starts serving.
         _telemetry_backfill_cutoff = time.time()
 
@@ -11360,12 +11342,12 @@ class GatewayOrchestrator:
         # Awaited ON the loop, never offloaded whole: WSSocketModeClient's
         # __init__ ends in ``asyncio.ensure_future``, which needs a current
         # event loop in the *constructing* thread — a ``to_thread`` worker has
-        # none, so offloading the whole function (as #7518 did to keep its
-        # blocking YOLO-grant profiles walk off the loop) crashed every
-        # Slack-enabled boot with "There is no current event loop".  The two
-        # blocking calls inside (the YOLO grant and the enterprise auth.test)
-        # are offloaded individually within the coroutine instead, preserving
-        # the security-relevant early-return ordering.  Pinned by
+        # none, so offloading the whole function — to keep its blocking
+        # YOLO-grant profiles walk off the loop — crashes every Slack-enabled boot with
+        # "There is no current event loop".  The two blocking calls inside (the YOLO
+        # grant and the enterprise auth.test) are offloaded individually within the
+        # coroutine instead, preserving the security-relevant early-return ordering.
+        # Pinned by
         # test_slack_events_coverage.py::TestInitSocketMode.
         await init_socket_mode(self, seen)
 
@@ -11483,9 +11465,9 @@ class GatewayOrchestrator:
                     _open_task.add_done_callback(self._background_tasks.discard)
             except Exception:
                 # Announcing the URL is BEST EFFORT and must never abort boot.
-                # This block used to sit inside a fire-and-forget task, so a
-                # failure here could not take the gateway down; moving it onto
-                # the boot path has to preserve that. The dashboard is already
+                # This block runs ON the boot path rather than inside a
+                # fire-and-forget task, so this except is what keeps a failure
+                # here from taking the gateway down. The dashboard is already
                 # listening either way — the operator loses a printed line, not
                 # the service, and `kirocrew token` still produces a URL.
                 logger.warning("Dashboard URL announcement failed", exc_info=True)
@@ -11680,9 +11662,9 @@ class GatewayOrchestrator:
         # The enabled-only gate below never calls a factory whose flag is
         # False — for a disabled and an enabled-but-uncredentialed channel
         # alike — so a factory-level skip-reason log can never be reached.
-        # Say WHY each channel is being skipped here, at the decision point
-        # (issues #304, #5418). Runs after KIROCREW_READY, outside the
-        # boot-path window. Each row lists exactly the credential operands its
+        # Say WHY each channel is being skipped here, at the decision point.
+        # Runs after KIROCREW_READY, outside the boot-path window. Each row lists
+        # exactly the credential operands its
         # _<channel>_enabled predicate reads: telegram folds in the
         # deprecated-accounts stop (which already has its own warning at
         # config-load time, so pointing at the token would misname the actual
@@ -11762,10 +11744,9 @@ class GatewayOrchestrator:
         await loop.run_in_executor(maintenance_executor(), self._badge_unready_channels, boot)
         self._channel_handles = await registry.start_channels(self, descriptors, permitted)
         # Tell the sender of whatever the SHUTDOWN GATE refused on the way down
-        # that it was never processed (issue #2217). Ordered AFTER the transports
-        # because the notice is sent through the channel that received the
-        # message, and detached from boot so a slow platform send cannot hold the
-        # gateway's start open.
+        # that it was never processed. Ordered AFTER the transports because the notice
+        # is sent through the channel that received the message, and detached from boot
+        # so a slow platform send cannot hold the gateway's start open.
         self._inbound_replay_task = asyncio.create_task(self._replay_spooled_inbound())
 
     async def _replay_spooled_inbound(self) -> None:
@@ -11837,7 +11818,7 @@ _SLICE_LIMITS_TASK: "asyncio.Task[None] | None" = None
 # Strong ref to the fire-and-forget agents-dir janitor sweep launched at boot
 # (the loop holds tasks weakly, so without this it could be GC'd mid-flight).
 _AGENTS_JANITOR_TASK: "asyncio.Task[None] | None" = None
-#: Strong ref for the liveness-keyed agent-scratch sweep loop (#5063).
+#: Strong ref for the liveness-keyed agent-scratch sweep loop.
 _AGENT_SCRATCH_SWEEP_TASK: "asyncio.Task[None] | None" = None
 
 
